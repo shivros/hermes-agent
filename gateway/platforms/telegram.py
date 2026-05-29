@@ -1262,6 +1262,7 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id: int,
         thread_id: int,
         name: str,
+        **kwargs,
     ) -> None:
         """Rename a forum topic in a private (DM) chat."""
         if not self._bot:
@@ -1274,6 +1275,7 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id=chat_id_arg,
             message_thread_id=int(thread_id),
             name=name,
+            **kwargs,
         )
         logger.info(
             "[%s] Renamed DM topic in chat %s thread_id=%s -> '%s'",
