@@ -1864,6 +1864,18 @@ def text_to_speech_tool(
         )
         text = text[:max_len]
 
+    # Normalize text for TTS: expand abbreviations (Mr.→Mister), convert numbers
+    # to words, clean symbols/URLs, etc. Uses the canonical tts_normalize module.
+    try:
+        import sys as _sys
+        _scripts_dir = os.path.expanduser("~/.hermes/scripts")
+        if _scripts_dir not in _sys.path:
+            _sys.path.insert(0, _scripts_dir)
+        from tts_normalize import tts_normalize as _tts_normalize
+        text = _tts_normalize(text)
+    except Exception as _norm_err:
+        logger.debug("TTS normalization unavailable or failed: %s", _norm_err)
+
     # Detect platform from gateway env var to choose the best output format.
     # Telegram voice bubbles require Opus (.ogg); OpenAI and ElevenLabs can
     # produce Opus natively (no ffmpeg needed).  Edge TTS always outputs MP3
