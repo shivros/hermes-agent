@@ -153,20 +153,39 @@ def _strip_legitimate_emoji_zwj(prompt: str) -> str:
 
 
 def _strip_cron_safe_constructs(prompt: str) -> str:
-    """Strip the GitHub `Authorization: token $GITHUB_TOKEN` auth-header
-    pattern so it doesn't trip the broader curl-auth-header exfil rule.
+    """Strip known safe auth-header patterns so they don't trip the broader
+    curl-auth-header exfil rule.
 
-    Allows the bundled GitHub skill fallback without opening a blanket
-    exemption for arbitrary Authorization-header exfiltration.
+    Each entry is (auth_header_regex, domain_must_appear, replacement).
+    The domain check is a simple string-contains so it works across line
+    continuations (curl \\\\n URL is two lines).
     """
-    github_auth_header = re.search(
-        rf'curl\s+[^\n]*(?:-H|--header)\s+["\']Authorization:\s*token\s+{_CRON_SECRET_VAR_RE}["\']'
-        r'\s+["\']?https://api\.github\.com(?:/|\b)',
-        prompt,
-        re.IGNORECASE,
-    )
-    if github_auth_header:
-        return prompt.replace(github_auth_header.group(0), "curl https://api.github.com/user")
+    _KNOWN_AUTH_ALLOWLIST = [
+        (
+            rf'curl\s+[^\n]*(?:-H|--header)\s+["\']Authorization:\s*token\s+{_CRON_SECRET_VAR_RE}["\']',
+            "api.github.com",
+            "curl https://api.github.com/user",
+        ),
+        (
+            rf'curl\s+[^\n]*(?:-H|--header)\s+["\']Authorization:\s*token\s+{_CRON_SECRET_VAR_RE}["\']',
+            "git.codefold.org",
+            "curl https://git.codefold.org/api/user",
+        ),
+        (
+            rf'curl\s+[^\n]*(?:-H|--header)\s+["\']Authorization:\s*Bearer\s+{_CRON_SECRET_VAR_RE}["\']',
+            "git.codefold.org",
+            "curl https://git.codefold.org/api/user",
+        ),
+        (
+            rf'curl\s+[^\n]*(?:-H|--header)\s+["\']Authorization:\s*(?:Bearer\s+)?{_CRON_SECRET_VAR_RE}["\']',
+            "api.linear.app",
+            "curl https://api.linear.app/graphql",
+        ),
+    ]
+    for auth_pattern, required_domain, replacement in _KNOWN_AUTH_ALLOWLIST:
+        m = re.search(auth_pattern, prompt, re.IGNORECASE)
+        if m and required_domain in prompt:
+            prompt = prompt.replace(m.group(0), replacement)
     return prompt
 
 
@@ -394,6 +413,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "schedule": job.get("schedule_display") or "?",
         "repeat": _repeat_display(job),
         "deliver": job.get("deliver", "local"),
+        "deliver_on_error": job.get("deliver_on_error"),
         "next_run_at": job.get("next_run_at"),
         "last_run_at": job.get("last_run_at"),
         "last_status": job.get("last_status"),
@@ -424,6 +444,7 @@ def cronjob(
     name: Optional[str] = None,
     repeat: Optional[int] = None,
     deliver: Optional[str] = None,
+    deliver_on_error: Optional[str] = None,
     include_disabled: bool = False,
     skill: Optional[str] = None,
     skills: Optional[List[str]] = None,
@@ -493,6 +514,7 @@ def cronjob(
                 name=name,
                 repeat=repeat,
                 deliver=_normalize_deliver_param(deliver),
+                deliver_on_error=_normalize_deliver_param(deliver_on_error),
                 origin=_origin_from_env(),
                 skills=canonical_skills,
                 model=_normalize_optional_job_value(model),
@@ -515,6 +537,7 @@ def cronjob(
                     "schedule": job["schedule_display"],
                     "repeat": _repeat_display(job),
                     "deliver": job.get("deliver", "local"),
+                    "deliver_on_error": job.get("deliver_on_error"),
                     "next_run_at": job["next_run_at"],
                     "job": _format_job(job),
                     "message": f"Cron job '{job['name']}' created.",
@@ -596,6 +619,8 @@ def cronjob(
                 updates["name"] = name
             if deliver is not None:
                 updates["deliver"] = _normalize_deliver_param(deliver)
+            if deliver_on_error is not None:
+                updates["deliver_on_error"] = _normalize_deliver_param(deliver_on_error)
             if skills is not None or skill is not None:
                 canonical_skills = _canonical_skills(skill, skills)
                 updates["skills"] = canonical_skills
@@ -728,7 +753,11 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "deliver": {
                 "type": "string",
-                "description": "Omit this parameter to auto-deliver back to the current chat and topic (recommended). Auto-detection preserves thread/topic context. Only set explicitly when the user asks to deliver somewhere OTHER than the current conversation. Values: 'origin' (same as omitting), 'local' (no delivery, save only), 'all' (fan out to every connected home channel), or platform:chat_id:thread_id for a specific destination. Combine with comma: 'origin,all' delivers to the origin plus every other connected channel. Examples: 'telegram:-1001234567890:17585', 'discord:#engineering', 'sms:+15551234567', 'all'. WARNING: 'platform:chat_id' without :thread_id loses topic targeting. 'all' resolves at fire time, so a job created before a channel was wired up will pick it up automatically once connected."
+                "description": "Omit this parameter to auto-deliver back to the current chat and topic (recommended). Auto-detection preserves thread/topic context. Only set explicitly when the user asks to deliver somewhere OTHER than the current conversation. Values: 'origin' (same as omitting), 'local' (no delivery, save only), 'all' (fan out to every connected home channel), or platform:chat_id:thread_id for a specific destination. Combine with comma: 'origin,all' delivers to the origin plus every other connected channel. Examples: 'telegram:-1001234567890:17585', 'discord:#engineering', 'sms:+155****4567', 'all'. WARNING: 'platform:chat_id' without :thread_id loses topic targeting. 'all' resolves at fire time, so a job created before a channel was wired up will pick it up automatically once connected."
+            },
+            "deliver_on_error": {
+                "type": "string",
+                "description": "Optional override for where to send failure output. Same syntax as 'deliver'. When set, job failures are delivered to this target instead of the normal deliver target. Success output always goes to 'deliver'. Set to 'local' to suppress error notifications entirely. Omit to keep backward-compatible behavior (failures go to 'deliver')."
             },
             "skills": {
                 "type": "array",
@@ -841,6 +870,7 @@ registry.register(
         name=args.get("name"),
         repeat=args.get("repeat"),
         deliver=args.get("deliver"),
+        deliver_on_error=args.get("deliver_on_error"),
         include_disabled=args.get("include_disabled", True),
         skill=args.get("skill"),
         skills=args.get("skills"),
