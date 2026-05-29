@@ -553,6 +553,12 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     return targets[0] if targets else None
 
 
+def _should_use_error_delivery(job: dict) -> bool:
+    """Whether a job has an explicit ``deliver_on_error`` override set."""
+    error_deliver = job.get("deliver_on_error")
+    return bool(error_deliver and _normalize_deliver_value(error_deliver) != "local")
+
+
 # Media extension sets — audio routing is centralized in gateway.platforms.base
 # via should_send_media_as_audio() so Telegram-specific rules stay in one place.
 _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
@@ -1952,7 +1958,11 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 delivery_error = None
                 if should_deliver:
                     try:
-                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                        delivery_job = job
+                        if not success and _should_use_error_delivery(job):
+                            delivery_job = dict(job)
+                            delivery_job["deliver"] = job["deliver_on_error"]
+                        delivery_error = _deliver_result(delivery_job, deliver_content, adapters=adapters, loop=loop)
                     except Exception as de:
                         delivery_error = str(de)
                         logger.error("Delivery failed for job %s: %s", job["id"], de)
