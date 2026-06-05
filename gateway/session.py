@@ -296,16 +296,23 @@ def build_session_context_prompt(
     # User identity.
     # In shared multi-user sessions (shared threads OR shared non-thread groups
     # when group_sessions_per_user=False), multiple users contribute to the same
-    # conversation.  Don't pin a single user name in the system prompt — it
-    # changes per-turn and would bust the prompt cache.  Instead, note that
-    # this is a multi-user session; individual sender names are prefixed on
-    # each user message by the gateway.
+    # conversation. Don't pin a single user name in the system prompt.
+    # Instead note the structure; only claim "multiple users participate"
+    # when we have evidence of distinct active senders. Threaded group topics
+    # are often used as 1:1 containers — do not imply third-party participants
+    # unless visible in the message history.
     if context.shared_multi_user_session:
-        session_label = "Multi-user thread" if context.source.thread_id else "Multi-user session"
-        lines.append(
-            f"**Session type:** {session_label} — messages are prefixed "
-            "with [sender name]. Multiple users may participate."
-        )
+        if context.source.thread_id:
+            lines.append(
+                "**Session type:** Threaded conversation — messages may be "
+                "prefixed with [sender name]. Treat as single-user unless "
+                "multiple distinct participants appear in history."
+            )
+        else:
+            lines.append(
+                "**Session type:** Multi-user session — messages are prefixed "
+                "with [sender name]. Multiple users may participate."
+            )
     elif context.source.user_name:
         lines.append(f"**User:** {context.source.user_name}")
     elif context.source.user_id:
