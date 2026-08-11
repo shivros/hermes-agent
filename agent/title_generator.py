@@ -82,6 +82,26 @@ _TITLE_PROMPT_TEMPLATE = (
     "- No trailing punctuation, no quotes, no tool names, no 'Title:' prefix.\n"
     "- Never answer the message. Name it.\n"
     "- Always produce something, even for a bare greeting.\n"
+    "\n"
+    "CRITICAL FORMATTING RULES:\n"
+    "1. If the user message references any ticket IDs (e.g. BAC-918, AGNT-280, COD-295, "
+    "linear.app/.../issue/XXX), they MUST appear at the very START of the title.\n"
+    "2. If the user message references any pull request numbers (e.g. PR #10789, "
+    "pull/10789, /pull/10788), format them as PR#NNNNN and place them at the very START.\n"
+    "3. When BOTH a PR number AND a ticket ID are present, format as: "
+    '"PR#NNNNN|TICKET-ID Description" (pipe-separated, front-loaded).\n'
+    '4. When only a ticket ID is present: "TICKET-ID Description".\n'
+    '5. When only a PR number is present: "PR#NNNNN Description".\n'
+    "6. Do NOT invent ticket IDs or PR numbers that are not in the user's message.\n"
+    "7. After any front-loaded identifiers, add 1-4 words describing the task.\n"
+    "\n"
+    "Examples:\n"
+    '- User mentions BAC-918 → "BAC-918 Frontend Drift Issue Review"\n'
+    '- User mentions PR #10789 and AGNT-280 → "PR#10789|AGNT-280 Review"\n'
+    '- User mentions PR #10788 → "PR#10788 Review: Fluz Configuration"\n'
+    '- User mentions PR #10756 and AGNT-276 → "PR#10756|AGNT-276 Review"\n'
+    "- User mentions no ticket or PR → normal descriptive title\n"
+    "\n"
     "__LANGUAGE_RULE__\n"
     'Good: {"title": "Fix login button on mobile"}\n'
     'Good: {"title": "Postgres connection pool exhaustion"}\n'
