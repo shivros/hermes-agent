@@ -1783,6 +1783,7 @@ def create_job(
     name: Optional[str] = None,
     repeat: Optional[int] = None,
     deliver: Optional[str] = None,
+    deliver_on_error: Optional[str] = None,
     origin: Optional[Dict[str, Any]] = None,
     skill: Optional[str] = None,
     skills: Optional[List[str]] = None,
@@ -1808,6 +1809,11 @@ def create_job(
         name: Optional friendly name
         repeat: How many times to run (None = forever, 1 = once)
         deliver: Where to deliver output ("origin", "local", "telegram", etc.)
+        deliver_on_error: Optional override for where to send failure output.
+            Same syntax as ``deliver``. When set, job failures are delivered to
+            this target instead of the normal ``deliver`` target. Success output
+            always goes to ``deliver``. ``None`` (default) means failures go to
+            ``deliver`` — backward compatible.
         origin: Source info where job was created (for "origin" delivery)
         skill: Optional legacy single skill name to load before running the prompt
         skills: Optional ordered list of skills to load before running the prompt
@@ -1986,6 +1992,7 @@ def create_job(
         "failure_streak": 0,
         # Delivery configuration
         "deliver": deliver,
+        "deliver_on_error": deliver_on_error,
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
