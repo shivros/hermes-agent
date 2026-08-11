@@ -3530,6 +3530,20 @@ def text_to_speech_tool(
     if not text:
         return tool_error("Text is empty after TTS cleanup", success=False)
 
+    # User-provided normalization pass: expand abbreviations (Mr.→Mister),
+    # convert numbers to words, clean symbols/URLs, etc. Uses the canonical
+    # tts_normalize module from ~/.hermes/scripts/ if present. Silent fallback
+    # if the module isn't found — the built-in pass above already ran.
+    try:
+        import sys as _sys
+        _scripts_dir = os.path.expanduser("~/.hermes/scripts")
+        if _scripts_dir not in _sys.path:
+            _sys.path.insert(0, _scripts_dir)
+        from tts_normalize import tts_normalize as _tts_normalize
+        text = _tts_normalize(text)
+    except Exception as _norm_err:
+        logger.debug("TTS normalization unavailable or failed: %s", _norm_err)
+
     tts_config = _load_tts_config()
 
     # When the model supplies a speed parameter, inject it into the config
