@@ -17969,6 +17969,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             group_sessions_per_user=_group_sessions_per_user,
             thread_sessions_per_user=_thread_sessions_per_user,
         )
+        # In a forum topic, each thread is its own session — suppress the
+        # multi-user sender prefix even though the chat is a shared group.
+        if source.thread_id and source.platform == Platform.TELEGRAM:
+            _is_shared_multi_user = False
         if _is_shared_multi_user and source.user_name:
             # source.user_name is the platform display name — attacker-
             # influenceable on any platform that lets participants set their
