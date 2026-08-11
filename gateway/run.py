@@ -5137,7 +5137,21 @@ class TurnRunner:
             # TitleCallback. Renaming twice lands on the same name at twice the
             # cost, and Discord's 2-per-10-minutes channel budget can spend
             # itself on the throwaway and drop the one worth showing.
-            if self._runner._is_telegram_topic_lane(source):
+            is_renamable = False
+            try:
+                is_renamable = self._runner._is_telegram_renamable_topic(source)
+            except Exception:
+                pass
+            logger.info(
+                "[topic-rename] _is_telegram_renamable_topic: %s (platform=%s chat_type=%s thread_id=%s chat_id=%s)",
+                is_renamable,
+                getattr(source, "platform", None),
+                getattr(source, "chat_type", None),
+                getattr(source, "thread_id", None),
+                getattr(source, "chat_id", None),
+            )
+            if is_renamable:
+                logger.info("[topic-rename] SOURCE IS RENAMABLE: attaching title_callback")
                 agent._on_session_title = lambda title, title_source: (
                     title_source == "llm"
                     and self._runner._schedule_telegram_topic_title_rename(
@@ -7665,6 +7679,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not tid or tid in self._TELEGRAM_GENERAL_TOPIC_IDS:
             return False
         return True
+
+    def _telegram_rename_exclude_ids(self) -> frozenset:
+        """Topic thread IDs excluded from auto-rename, loaded from config.
+
+        Reads ``gateway.telegram.extra.topic_rename_exclude_ids`` (a list of
+        string/int IDs). Default: ``["0"]`` (the General topic in groups).
+        """
+        try:
+            platform_cfg = (
+                self.config.platforms.get(Platform.TELEGRAM)
+                if getattr(self, "config", None) and getattr(self.config, "platforms", None)
+                else None
+            )
+            if platform_cfg is None:
+                return frozenset({"0"})
+            extra = getattr(platform_cfg, "extra", None) or {}
+            ids = extra.get("topic_rename_exclude_ids", ["0"])
+            if isinstance(ids, list):
+                return frozenset(str(i) for i in ids)
+            return frozenset({"0"})
+        except Exception:
+            return frozenset({"0"})
+
+    def _is_telegram_renamable_topic(self, source: SessionSource) -> bool:
+        """True for any Telegram topic that can be auto-renamed.
+
+        Covers both DM topic lanes (via ``_is_telegram_topic_lane``) and
+        group/supergroup forum topics (``chat_type`` in ``{"group", "supergroup", "forum"}``).
+        Excludes the General topic and any IDs in the config exclude list.
+        """
+        if source.platform != Platform.TELEGRAM:
+            return False
+        tid = str(source.thread_id or "")
+        if not tid:
+            return False
+        if tid in self._TELEGRAM_GENERAL_TOPIC_IDS:
+            return False
+        if tid in self._telegram_rename_exclude_ids():
+            return False
+        # DM topic lanes: use the full DM predicate
+        if source.chat_type == "dm":
+            return self._is_telegram_topic_lane(source)
+        # Group/supergroup forum topics: just need a non-general thread_id
+        if source.chat_type in ("group", "supergroup", "forum"):
+            return True
+        return False
 
     _TELEGRAM_LOBBY_REMINDER_COOLDOWN_S = 30.0
 
@@ -22745,8 +22805,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_id: str,
         title: str,
     ) -> None:
-        """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
-        if not await asyncio.to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
+        """Best-effort rename of a Telegram topic when Hermes auto-titles a session."""
+        if not await asyncio.to_thread(self._is_telegram_renamable_topic, source) or not source.chat_id or not source.thread_id:
             return
 
         # Operator can fully disable per-topic auto-rename via
@@ -22796,11 +22856,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             rename_topic = getattr(adapter, "rename_dm_topic", None)
             if rename_topic is not None:
-                await rename_topic(
-                    chat_id=str(source.chat_id),
-                    thread_id=str(source.thread_id),
-                    name=topic_name,
-                )
+                try:
+                    await rename_topic(
+                        chat_id=str(source.chat_id),
+                        thread_id=str(source.thread_id),
+                        name=topic_name,
+                    )
+                except Exception as rename_exc:
+                    retry_after = getattr(rename_exc, "retry_after", None)
+                    if retry_after is not None:
+                        delay = min(float(retry_after) + 2.0, 60.0)
+                        logger.info(
+                            "[topic-rename] RetryAfter %ss, retrying in %.1fs",
+                            retry_after, delay,
+                        )
+                        await asyncio.sleep(delay)
+                        await rename_topic(
+                            chat_id=str(source.chat_id),
+                            thread_id=str(source.thread_id),
+                            name=topic_name,
+                        )
+                    else:
+                        raise
                 return
 
             bot = getattr(adapter, "_bot", None)
@@ -22810,11 +22887,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if edit_forum_topic is None:
                 return
             try:
-                await edit_forum_topic(
-                    chat_id=int(source.chat_id),
-                    message_thread_id=int(source.thread_id),
-                    name=topic_name,
-                )
+                try:
+                    await edit_forum_topic(
+                        chat_id=int(source.chat_id),
+                        message_thread_id=int(source.thread_id),
+                        name=topic_name,
+                    )
+                except Exception as edit_exc:
+                    retry_after = getattr(edit_exc, "retry_after", None)
+                    if retry_after is not None:
+                        delay = min(float(retry_after) + 2.0, 60.0)
+                        logger.info(
+                            "[topic-rename] RetryAfter %ss on edit_forum_topic, retrying in %.1fs",
+                            retry_after, delay,
+                        )
+                        await asyncio.sleep(delay)
+                        await edit_forum_topic(
+                            chat_id=int(source.chat_id),
+                            message_thread_id=int(source.thread_id),
+                            name=topic_name,
+                        )
+                    else:
+                        raise
             except (TypeError, ValueError):
                 await edit_forum_topic(
                     chat_id=source.chat_id,
@@ -22854,7 +22948,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         title: str,
     ) -> None:
         """Schedule a topic rename from the auto-title background thread."""
-        if not title or not self._is_telegram_topic_lane(source):
+        if not title or not self._is_telegram_renamable_topic(source):
             return
         if self._telegram_topic_auto_rename_disabled(source):
             return
