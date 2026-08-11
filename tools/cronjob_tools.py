@@ -188,33 +188,58 @@ def _strip_legitimate_emoji_zwj(prompt: str) -> str:
 
 
 def _strip_cron_safe_constructs(prompt: str) -> str:
-    """Strip the GitHub `Authorization: token $GITHUB_TOKEN` auth-header
-    pattern so it doesn't trip the broader curl-auth-header exfil rule.
+    """Strip known safe auth-header patterns so they don't trip the broader
+    curl-auth-header exfil rule.
 
-    Allows the bundled GitHub skill fallback without opening a blanket
-    exemption for arbitrary Authorization-header exfiltration.
+    Each entry is (auth_header_regex, domain_must_appear, replacement).
+    The domain check is a simple string-contains so it works across line
+    continuations (curl \\n URL is two lines).
 
     Uses ``re.sub`` so EVERY occurrence is scrubbed, not just the first — a
-    cron job that loads 2+ GitHub skills (e.g. github-issues +
-    github-pr-workflow + github-code-review) contains several such blocks,
-    and the old ``re.search`` + single ``str.replace`` left the rest to trip
-    the exfil_curl_auth_header detector on every run. The trailing
+    cron job that loads 2+ skills (e.g. github-issues + github-pr-workflow +
+    github-code-review) contains several such blocks, and the old
+    ``re.search`` + single ``str.replace`` left the rest to trip the
+    exfil_curl_auth_header detector on every run. The trailing
     ``[^\\s;&|$`]*`` consumes only the URL path — never whitespace, command
     separators, or subshell openers — so a payload smuggled onto the same
     line (``;``, ``&&``, ``|``, ``$(...)``, backticks) survives the strip
-    and is still scanned. The host must be exactly ``api.github.com``
-    followed by ``/``, whitespace, quote, or end: lookalike authorities
+    and is still scanned. The host must match exactly (followed by ``/``,
+    whitespace, quote, or end): lookalike authorities
     (``api.github.com.evil.com``, ``api.github.com@evil.com``) are not the
     trusted construct and fall through to the exfil detectors, while
     legitimately quoted bare-host URLs stay exempt.
     """
-    return re.sub(
-        rf'curl\s+[^\n;&|$`]*(?:-H|--header)\s+["\']Authorization:\s*token\s+{_CRON_SECRET_VAR_RE}["\']'
-        r'\s+["\']?https://api\.github\.com(?::\d+)?(?:/|\s|$|["\'])[^\s;&|$`]*',
-        'curl https://api.github.com/user',
-        prompt,
-        flags=re.IGNORECASE,
-    )
+    _KNOWN_AUTH_ALLOWLIST = [
+        (
+            rf'curl\s+[^\n;&|$`]*(?:-H|--header)\s+["\']Authorization:\s*token\s+{_CRON_SECRET_VAR_RE}["\']'
+            r'\s+["\']?https://api\.github\.com(?::\d+)?(?:/|\s|$|["\'])[^\s;&|$`]*',
+            "api.github.com",
+            "curl https://api.github.com/user",
+        ),
+        (
+            rf'curl\s+[^\n;&|$`]*(?:-H|--header)\s+["\']Authorization:\s*token\s+{_CRON_SECRET_VAR_RE}["\']'
+            r'\s+["\']?https://git\.codefold\.org(?::\d+)?(?:/|\s|$|["\'])[^\s;&|$`]*',
+            "git.codefold.org",
+            "curl https://git.codefold.org/api/user",
+        ),
+        (
+            rf'curl\s+[^\n;&|$`]*(?:-H|--header)\s+["\']Authorization:\s*Bearer\s+{_CRON_SECRET_VAR_RE}["\']'
+            r'\s+["\']?https://git\.codefold\.org(?::\d+)?(?:/|\s|$|["\'])[^\s;&|$`]*',
+            "git.codefold.org",
+            "curl https://git.codefold.org/api/user",
+        ),
+        (
+            rf'curl\s+[^\n;&|$`]*(?:-H|--header)\s+["\']Authorization:\s*(?:Bearer\s+)?{_CRON_SECRET_VAR_RE}["\']'
+            r'\s+["\']?https://api\.linear\.app(?::\d+)?(?:/|\s|$|["\'])[^\s;&|$`]*',
+            "api.linear.app",
+            "curl https://api.linear.app/graphql",
+        ),
+    ]
+    for auth_pattern, required_domain, replacement in _KNOWN_AUTH_ALLOWLIST:
+        m = re.search(auth_pattern, prompt, re.IGNORECASE)
+        if m and required_domain in prompt:
+            prompt = re.sub(auth_pattern, replacement, prompt, flags=re.IGNORECASE)
+    return prompt
 
 
 def _check_invisible_unicode(prompt: str) -> str:
@@ -634,6 +659,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "schedule": job.get("schedule_display") or "?",
         "repeat": _repeat_display(job),
         "deliver": job.get("deliver", "local"),
+        "deliver_on_error": job.get("deliver_on_error"),
         "next_run_at": job.get("next_run_at"),
         "last_run_at": job.get("last_run_at"),
         "last_status": job.get("last_status"),
@@ -1185,6 +1211,7 @@ def cronjob(
     name: Optional[str] = None,
     repeat: Optional[int] = None,
     deliver: Optional[str] = None,
+    deliver_on_error: Optional[str] = None,
     include_disabled: bool = False,
     skill: Optional[str] = None,
     skills: Optional[List[str]] = None,
@@ -1288,6 +1315,9 @@ def cronjob(
                     deliver=_resolve_cron_context_deliver(
                         _normalize_deliver_param(deliver)
                     ),
+                    deliver_on_error=_resolve_cron_context_deliver(
+                        _normalize_deliver_param(deliver_on_error)
+                    ),
                     origin=_origin_from_env(),
                     skills=canonical_skills,
                     model=_normalize_optional_job_value(model),
@@ -1319,6 +1349,7 @@ def cronjob(
                     "schedule": job["schedule_display"],
                     "repeat": _repeat_display(job),
                     "deliver": job.get("deliver", "local"),
+                    "deliver_on_error": job.get("deliver_on_error"),
                     "next_run_at": job["next_run_at"],
                     "job": _format_job(job),
                     "message": _create_message,
@@ -1472,6 +1503,10 @@ def cronjob(
             if deliver is not None:
                 updates["deliver"] = _resolve_cron_context_deliver(
                     _normalize_deliver_param(deliver)
+                )
+            if deliver_on_error is not None:
+                updates["deliver_on_error"] = _resolve_cron_context_deliver(
+                    _normalize_deliver_param(deliver_on_error)
                 )
             if skills is not None or skill is not None:
                 canonical_skills = _canonical_skills(skill, skills)
@@ -1663,6 +1698,10 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
                 "type": "string",
                 "description": "Omit this parameter to auto-deliver back to the current chat and topic (recommended). Auto-detection preserves thread/topic context. Only set explicitly when the user asks to deliver somewhere OTHER than the current conversation. Values: 'origin' (same as omitting), 'local' (no delivery, save only), 'all' (fan out to every connected home channel), or platform:chat_id:thread_id for a specific destination. Combine with comma: 'origin,all' delivers to the origin plus every other connected channel. Examples: 'telegram:-1001234567890:17585', 'discord:#engineering', 'sms:+15551234567', 'all'. WARNING: 'platform:chat_id' without :thread_id loses topic targeting. 'all' resolves at fire time, so a job created before a channel was wired up will pick it up automatically once connected."
             },
+            "deliver_on_error": {
+                "type": "string",
+                "description": "Optional override for where to send failure output. Same syntax as 'deliver'. When set, job failures are delivered to this target instead of the normal deliver target. Success output always goes to 'deliver'. Set to 'local' to suppress error notifications entirely. Omit to keep backward-compatible behavior (failures go to 'deliver')."
+            },
             "skills": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1780,6 +1819,7 @@ registry.register(
         name=args.get("name"),
         repeat=args.get("repeat"),
         deliver=args.get("deliver"),
+        deliver_on_error=args.get("deliver_on_error"),
         include_disabled=args.get("include_disabled", True),
         skill=args.get("skill"),
         skills=args.get("skills"),
