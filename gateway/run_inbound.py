@@ -1390,6 +1390,10 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             source, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
         )
+        # Telegram forum topics are already their own conversation lane; the
+        # shared group chat must not prepend a per-sender label to every turn.
+        if source.platform == Platform.TELEGRAM and source.thread_id:
+            _is_shared_multi_user = False
         if _is_shared_multi_user and source.user_name:
             # Display names are attacker-influenceable: neutralize newlines/control chars or a
             # hostile name masquerades as a fake markdown section (mirrors build_session_context_prompt).

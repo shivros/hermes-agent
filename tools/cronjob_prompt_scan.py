@@ -71,22 +71,28 @@ def _zwj_has_emoji_neighbour(text: str, idx: int) -> bool:
     )
 
 
-def _strip_cron_safe_constructs(prompt: str) -> str:
-    """Scrub the bundled GitHub skill's `Authorization: token $GITHUB_TOKEN` + api.github.com
-    curl so it doesn't trip the auth-header exfil rule.
+_AUTH_HEADER_ALLOWLIST = (
+    ("token", "api.github.com", "curl https://api.github.com/user"),
+    ("token", "git.codefold.org", "curl https://git.codefold.org/api/user"),
+    ("bearer", "git.codefold.org", "curl https://git.codefold.org/api/user"),
+    ("bearer", "api.linear.app", "curl https://api.linear.app/graphql"),
+)
 
-    re.sub scrubs EVERY occurrence. The trailing ``[^\\s;&|$`]*`` consumes only the URL path —
-    never separators or subshell openers — so a payload smuggled onto the same line still gets
-    scanned. Host must be exactly api.github.com followed by ``/``, whitespace, quote, or end:
-    lookalike authorities (api.github.com.evil.com, api.github.com@evil.com) fall through.
+
+def _strip_cron_safe_constructs(prompt: str) -> str:
+    """Scrub narrow auth-header examples for trusted API hosts.
+
+    The host must match exactly, and the credential must be a secret-variable reference.
+    Shell separators and subshell openers remain outside the match for subsequent scanning.
     """
-    return re.sub(
-        rf'curl\s+[^\n;&|$`]*(?:-H|--header)\s+["\']Authorization:\s*token\s+{_CRON_SECRET_VAR_RE}["\']'
-        r'\s+["\']?https://api\.github\.com(?::\d+)?(?:/|\s|$|["\'])[^\s;&|$`]*',
-        'curl https://api.github.com/user',
-        prompt,
-        flags=re.IGNORECASE,
-    )
+    for scheme, host, replacement in _AUTH_HEADER_ALLOWLIST:
+        pattern = (
+            rf'curl\s+[^\n;&|$`]*(?:-H|--header)\s+["\']Authorization:\s*{scheme}\s+'
+            rf'{_CRON_SECRET_VAR_RE}["\']\s+["\']?https://{re.escape(host)}'
+            r'(?::\d+)?(?:/|\s|$|["\'])[^\s;&|$`]*'
+        )
+        prompt = re.sub(pattern, replacement, prompt, flags=re.IGNORECASE)
+    return prompt
 
 
 def _strip_invisible_unicode(prompt: str) -> tuple[str, list[str]]:

@@ -859,10 +859,14 @@ def _expand_routing_tokens(part: str) -> list[str]:
 
 def _delivery_lane_value(job: dict, *, for_failure: bool = False):
     """Raw deliver-lane value for a run outcome: the failure lane when ``for_failure`` and the job
-    overrides it, else ``deliver``. Bookkeeping (outcome classification, unresolved-origin, incident
-    'alerted' marking) must read the SAME lane the notice was routed through (NS-788)."""
+    overrides it, else ``deliver``. Reads legacy ``deliver_on_error`` only when the canonical
+    ``failure_deliver`` field is absent. Bookkeeping must use the same routed lane."""
     if for_failure:
-        failure_deliver = job.get("failure_deliver")
+        if "failure_deliver" in job:
+            failure_deliver = job.get("failure_deliver")
+        else:
+            # Compatibility for jobs written by the former local patch.
+            failure_deliver = job.get("deliver_on_error")
         if failure_deliver is not None and str(failure_deliver).strip():
             return failure_deliver
     return job.get("deliver", "local")

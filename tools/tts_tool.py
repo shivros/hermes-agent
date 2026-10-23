@@ -24,7 +24,7 @@ from typing import Callable, Dict, Any, List, Optional
 
 import copy
 
-from hermes_constants import display_hermes_home
+from hermes_constants import display_hermes_home, get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,27 @@ def _resolve_provider_key(env_var: str, provider_id: str) -> str:
     """Resolve a TTS provider API key via the shared voice-key resolver (config > env/.env > pool)."""
     from tools.tool_backend_helpers import resolve_provider_secret
     return resolve_provider_secret(env_var, provider_id)
+
+
+def _apply_user_tts_normalizer(text: str) -> str:
+    """Apply the optional ``HERMES_HOME/scripts/tts_normalize.py`` hook, if present."""
+    try:
+        script = get_hermes_home() / "scripts" / "tts_normalize.py"
+        if not script.is_file():
+            return text
+        spec = importlib.util.spec_from_file_location("_hermes_profile_tts_normalize", script)
+        if spec is None or spec.loader is None:
+            return text
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        normalizer = getattr(module, "tts_normalize", None)
+        if not callable(normalizer):
+            return text
+        result = normalizer(text)
+        return result if isinstance(result, str) else text
+    except Exception:
+        logger.debug("User TTS normalization unavailable or failed", exc_info=True)
+        return text
 
 
 from tools.tts_command_provider import (
@@ -471,6 +492,9 @@ def text_to_speech_tool(
         text = text.strip()
     if not text:
         return tool_error("Text is empty after TTS cleanup", success=False)
+    text = _apply_user_tts_normalizer(text)
+    if not text:
+        return tool_error("Text is empty after user TTS normalization", success=False)
     tts_config, provider = _apply_call_overrides(_load_tts_config(), speed, provider)
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
     max_len = _resolve_max_text_length(provider, tts_config)

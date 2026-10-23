@@ -1014,8 +1014,13 @@ def cronjob(
     paused: bool = False,
     paused_reason: Optional[str] = None,
     pinned: Optional[bool] = None,
-    interpreter: Optional[str] = None) -> str:
+    interpreter: Optional[str] = None,
+    deliver_on_error: Optional[str | list[str]] = None) -> str:
     """Unified cron job management tool."""
+    if deliver_on_error is not None:
+        if failure_deliver is not None:
+            return tool_error("Use only one of deliver_on_error or failure_deliver.", success=False)
+        failure_deliver = deliver_on_error
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility
     try:
@@ -1101,6 +1106,10 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             "failure_deliver": {
                 "type": "string",
                 "description": "Optional override target for FAILURE notices only (same grammar as deliver). When set, engine failure/interruption notices go here instead of the deliver target; 'local' suppresses them entirely (state still recorded in cron list/run history). Use for jobs delivering into shared channels where failure noise is unwanted. Omit = failures follow deliver (default). On update, '' clears."
+            },
+            "deliver_on_error": {
+                "type": "string",
+                "description": "Legacy alias for failure_deliver: optional override target for failure notices, using the same grammar. Prefer failure_deliver. On update, '' clears."
             },
             "skills": {
                 "type": "array",

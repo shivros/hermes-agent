@@ -512,6 +512,12 @@ def _format_job(job: dict[str, Any]) -> dict[str, Any]:
     for key in _FORMAT_JOB_OPTIONAL_KEYS:
         if job.get(key):
             result[key] = True if key == "no_agent" else job[key]
+    failure_deliver = job.get("failure_deliver")
+    if failure_deliver is None:
+        failure_deliver = job.get("deliver_on_error")
+    if failure_deliver is not None:
+        result["failure_deliver"] = failure_deliver
+        result["deliver_on_error"] = failure_deliver
     stored_refs = job.get("context_from") or []
     if isinstance(stored_refs, str):
         stored_refs = [stored_refs]

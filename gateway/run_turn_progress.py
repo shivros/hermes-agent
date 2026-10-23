@@ -966,7 +966,14 @@ class GatewayTurnProgressMixin:
             # Relay Discord predicate is shape-only: whether the connector auto-threaded our reply is
             # only knowable AFTER delivery, so register eagerly and let the rename lane look up the
             # cache at fire time — gating registration on the cache read meant it never registered.
-            if runner._is_telegram_topic_lane(source):
+            is_renamable = runner._is_telegram_renamable_topic(source)
+            logger.info(
+                "[topic-rename] eligible=%s chat_type=%s thread_id=%s chat_id=%s",
+                is_renamable, getattr(source, "chat_type", None),
+                getattr(source, "thread_id", None), getattr(source, "chat_id", None),
+            )
+            if is_renamable:
+                logger.info("[topic-rename] attaching Telegram topic title callback")
                 lane = "_schedule_telegram_topic_title_rename"
             elif runner._is_discord_auto_thread_lane(source) or runner._is_relay_discord_channel_lane(source):
                 lane = "_schedule_discord_semantic_thread_rename"

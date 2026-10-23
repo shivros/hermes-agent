@@ -299,6 +299,21 @@ class TestToolSurface:
     """cronjob(action=create/update) accepts failure_deliver with deliver's
     validation — reusing the same normalize/validate helpers."""
 
+    def test_imported_legacy_job_definition_retains_deliver_on_error(self):
+        from cron.job_definition import merge_job_definition
+        from cron.jobs import parse_schedule
+
+        schedule = parse_schedule("every 1h")
+        local = {
+            "id": "scout", "deliver": "slack:D0MAIN", "deliver_on_error": "local",
+            "schedule": schedule, "repeat": {"times": None, "completed": 0},
+        }
+        authored = {
+            "deliver": "slack:D0MAIN", "deliver_on_error": "slack:D0ALERTS",
+            "schedule": schedule, "repeat": {"times": None},
+        }
+        assert merge_job_definition(local, authored)["deliver_on_error"] == "slack:D0ALERTS"
+
     def test_create_stores_failure_deliver(self, cron_env):
         from tools.cronjob_tools import cronjob
         from cron.jobs import get_job
@@ -323,6 +338,36 @@ class TestToolSurface:
         ))
         assert result["success"] is True
         assert "failure_deliver" not in get_job(result["job_id"])
+
+    def test_deliver_on_error_alias_maps_to_canonical_failure_deliver(self, cron_env):
+        from tools.cronjob_tools import CRONJOB_SCHEMA, cronjob
+        from cron.jobs import get_job
+
+        result = json.loads(cronjob(
+            action="create", prompt="scan", schedule="every 1h", deliver_on_error="local",
+        ))
+        stored = get_job(result["job_id"])
+        assert result["success"] is True
+        assert stored["failure_deliver"] == "local"
+        assert "deliver_on_error" not in stored
+        assert result["job"]["deliver_on_error"] == "local"
+        assert "deliver_on_error" in CRONJOB_SCHEMA["parameters"]["properties"]
+
+    def test_update_deliver_on_error_alias_clears_canonical_override(self, cron_env):
+        from cron.jobs import create_job, get_job
+        from tools.cronjob_tools import cronjob
+
+        job = create_job(prompt="scan", schedule="every 1h")
+        set_result = json.loads(cronjob(
+            action="update", job_id=job["id"], deliver_on_error="slack:D0ALERTS",
+        ))
+        assert set_result["success"] is True
+        assert get_job(job["id"])["failure_deliver"] == "slack:D0ALERTS"
+        clear_result = json.loads(cronjob(
+            action="update", job_id=job["id"], deliver_on_error="",
+        ))
+        assert clear_result["success"] is True
+        assert not get_job(job["id"]).get("failure_deliver")
 
     def test_create_flattens_list_value_like_deliver(self, cron_env):
         from tools.cronjob_tools import cronjob
@@ -378,6 +423,12 @@ class TestOutcomeBookkeeping:
     read the SAME lane the notice was actually routed through, or the
     execution history and incident store record lies (silenced failures
     logged 'delivered'; delivered failures logged 'not_configured')."""
+
+    def test_legacy_deliver_on_error_job_routes_failure_lane(self):
+        assert sched_delivery._delivery_lane_value(
+            {"deliver": "slack:D0MAIN", "deliver_on_error": "local"},
+            for_failure=True,
+        ) == "local"
 
     @staticmethod
     def _outcome(state):
