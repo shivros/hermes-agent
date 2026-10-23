@@ -577,6 +577,66 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert "referenced script" in result["error"]
 
 
+    def test_unscannable_referenced_cli_requires_one_time_approval(
+        self, monkeypatch, tmp_path
+    ):
+        import cron.lifecycle_guard as lifecycle_guard
+        import tools.approval as approval
+        import tools.approval_context as approval_context
+        import tools.terminal_tool as tt
+
+        class _RecordingEnv:
+            env = {}
+
+            def __init__(self):
+                self.commands = []
+
+            def execute(self, command, **kwargs):
+                self.commands.append(command)
+                return {"output": "executed", "returncode": 0}
+
+        env = _RecordingEnv()
+        self._patch_env(monkeypatch, env, inside_gateway=True)
+        monkeypatch.setattr(lifecycle_guard, "_MAX_REFERENCED_SCRIPT_BYTES", 64)
+        monkeypatch.setattr(approval, "_presence", lambda callback: (callback, True, False, False))
+        monkeypatch.setattr(approval, "_tirith_scan", lambda _command: {"action": "allow", "findings": []})
+        monkeypatch.setattr(approval, "detect_dangerous_command", lambda _command: (False, None, None))
+        monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "smart")
+
+        script = tmp_path / "cli.bundle.cjs"
+        script.write_text("#!/usr/bin/env node\n" + "x" * 128, encoding="utf-8")
+        command = f"{script} logs --help"
+        prompts = []
+
+        def approve_once(command, description, *, allow_permanent=True, allow_session=True, smart_denied=False):
+            prompts.append({
+                "command": command,
+                "description": description,
+                "allow_permanent": allow_permanent,
+                "allow_session": allow_session,
+            })
+            return "once"
+
+        session_token = approval_context.set_current_session_key("oversized-script-review")
+        tt.set_approval_callback(approve_once)
+        try:
+            result = json.loads(tt.terminal_tool(command=command))
+        finally:
+            tt.set_approval_callback(None)
+            approval_context.reset_current_session_key(session_token)
+
+        assert len(prompts) == 1
+        assert prompts[0]["command"] == command
+        assert "lifecycle scan uncertainty" in prompts[0]["description"].lower()
+        assert "gateway stop/restart" in prompts[0]["description"].lower()
+        assert prompts[0]["allow_permanent"] is False
+        assert prompts[0]["allow_session"] is False
+        assert env.commands == [command]
+        assert result["exit_code"] == 0
+        assert "approved by the user" in result["approval"]
+
+
     def test_oversized_root_skips_launchctl_prescan_and_fails_closed(
         self, monkeypatch
     ):

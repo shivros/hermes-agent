@@ -17,7 +17,7 @@ import importlib
 import logging
 import os
 import threading
-from typing import Optional
+from typing import Any, Optional
 
 from utils import env_var_enabled, is_truthy_value
 from agent.i18n import t
@@ -545,26 +545,33 @@ def _gateway_notify_cb(session_key: str):
 
 def _pending_result(spec, session_key: str, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str], body: str | None,
-                    smart_denied: bool) -> dict:
+                    smart_denied: bool, allow_session: bool = True,
+                    allow_permanent: bool = True) -> dict:
     """Queue an approval nobody can answer right now (no gateway notifier, no CLI panel) for
     ``/approve`` / ``/deny`` review. Command/code gates return the backward-compatible
     ``pending_approval`` shape (``pattern_keys`` + STOP text); the action gate ``approval_required``."""
-    pending = {"command": command, "pattern_key": pattern_key}
+    pending: dict[str, Any] = {"command": command, "pattern_key": pattern_key}
     if spec.pending_keys:
         pending["pattern_keys"] = pattern_keys
     pending["description"] = description
+    if not allow_session:
+        pending["allow_session"] = False
+    if not allow_permanent:
+        pending["allow_permanent"] = False
     if smart_denied:
-        pending.update(smart_denied=True, allow_permanent=False)
+        pending.update(smart_denied=True, allow_permanent=False, allow_session=False)
     submit_pending(session_key, pending)
     if not spec.pending_keys:
         return {
             "approved": False, "pattern_key": pattern_key, "status": "approval_required",
             "command": command, "description": description,
+            **({"allow_session": False} if not allow_session else {}),
+            **({"allow_permanent": False} if not allow_permanent else {}),
             "message": (f"⚠️ This action is potentially dangerous ({description}). "
                         f"Asking the user for approval.\n\n**Target:**\n```\n{command}\n```"),
         }
     body = body or f"**Command:**\n```\n{command}\n```"
-    result = {
+    result: dict[str, Any] = {
         "approved": False, "pattern_key": pattern_key, "status": "pending_approval",
         "approval_pending": True, "command": command, "description": description,
         "message": (
@@ -574,8 +581,12 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
             "user's decision; if this turn must end, report that approval is pending."
         ),
     }
+    if not allow_session:
+        result["allow_session"] = False
+    if not allow_permanent:
+        result["allow_permanent"] = False
     if smart_denied:
-        result.update(smart_denied=True, allow_permanent=False)
+        result.update(smart_denied=True, allow_permanent=False, allow_session=False)
     return result
 
 
@@ -794,13 +805,14 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str], warnings: list[tuple],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
                     is_ask: bool, smart: bool = False,
-                    permanent_capable: bool = True, pending_body=None) -> dict:
+                    permanent_capable: bool = True, session_capable: bool = True,
+                    pending_body=None) -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
     ``warnings`` are the ``(key, _, is_tirith)`` tuples :func:`_persist_choice` stores on
-    session/always. ``permanent_capable`` hides [a]lways when no key could be permanently
-    allowlisted (pure-tirith prompts); a smart-DENY owner override reduces every surface to
-    once/deny and persists nothing. ``pending_body`` is a thunk, built only once a human is
+    session/always. ``permanent_capable`` hides [a]lways; ``session_capable`` can further narrow
+    the decision to this operation only. A smart-DENY owner override also reduces every surface
+    to once/deny and persists nothing. ``pending_body`` is a thunk, built only once a human is
     actually asked, so a smart APPROVE never pays for redacting a large script.
     """
     from agent.redact import redact_sensitive_text
@@ -813,6 +825,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             return result
     pending_body = pending_body() if pending_body else None
     allow_permanent = permanent_capable and not smart_denied
+    allow_session = session_capable and not smart_denied
 
     def deny(template: str, outcome: str, **fmt) -> dict:
         breaker = ""
@@ -825,7 +838,11 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                        outcome=outcome, noun=spec.noun, **extra)
 
     def grant(choice: str) -> dict:
-        # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
+        # Older/custom transports may return a broader scope than this gate offered.
+        if choice == "always" and not allow_permanent:
+            choice = "once"
+        if choice == "session" and not allow_session:
+            choice = "once"
         if not smart_denied:
             _persist_choice(session_key, choice, warnings)
         if spec.user_approved:
@@ -836,7 +853,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         attempt = _present_with_selected_transport(
             command=command, description=description, pattern_key=pattern_key, pattern_keys=pattern_keys,
             session_key=session_key, surface="gateway" if (is_gateway or is_ask) else "cli",
-            allow_session=not smart_denied, allow_permanent=allow_permanent,
+            allow_session=allow_session, allow_permanent=allow_permanent,
         )
         choice, denied = _transport_choice(attempt, pattern_key=pattern_key, description=description)
         if denied is not None:
@@ -862,8 +879,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             data = {
                 "command": display_command, "pattern_key": pattern_key,
                 "pattern_keys": pattern_keys, "description": display_description,
-                "allow_permanent": permanent_capable and not smart_denied,
-                "allow_session": not smart_denied,
+                "allow_permanent": allow_permanent,
+                "allow_session": allow_session,
             }
             if smart_denied:
                 data["smart_denied"] = True
@@ -902,6 +919,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             return _pending_result(
                 spec, session_key, command=display_command, description=display_description, pattern_key=pattern_key,
                 pattern_keys=pattern_keys, body=pending_body, smart_denied=smart_denied,
+                allow_session=allow_session, allow_permanent=allow_permanent,
             )
 
     # CLI interactive: single combined prompt, wrapped in the pre/post plugin hooks.
@@ -912,8 +930,14 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     hook_kwargs = dict(command=prompt_command, description=prompt_description, pattern_key=pattern_key,
                        pattern_keys=list(pattern_keys), session_key=session_key, surface="cli")
     approval_context._fire_approval_hook("pre_approval_request", **hook_kwargs)
-    choice = prompt_dangerous_approval(prompt_command, prompt_description, allow_permanent=allow_permanent,
-                                       smart_denied=smart_denied, approval_callback=approval_callback)
+    choice = prompt_dangerous_approval(
+        prompt_command,
+        prompt_description,
+        allow_permanent=allow_permanent,
+        allow_session=allow_session,
+        smart_denied=smart_denied,
+        approval_callback=approval_callback,
+    )
     approval_context._fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
     if choice == "timeout":
         return deny(spec.cli_timeout, "timeout")
@@ -1167,45 +1191,66 @@ def _tirith_scan(command: str) -> dict:
 
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
-    """Run all pre-exec security checks and return a single approval decision. Tirith and
-    dangerous-command findings are presented as ONE combined approval request, so a gateway
-    force=True replay cannot bypass one check when only the other was shown to the user.
-    ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow."""
-    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+                             has_host_access: bool = False,
+                             required_review: Optional[tuple[str, str]] = None) -> dict:
+    """Run terminal security checks, optionally requiring a manual scan-uncertainty review.
+
+    Tirith and dangerous-command findings are normally combined into one approval. A
+    ``required_review`` is different: the lifecycle guard could not inspect a referenced
+    executable, so a human must explicitly approve this operation even in smart/yolo/off mode.
+    The review is one-shot; it cannot become a session or permanent allowlist entry.
+    """
+    manual_review = required_review is not None
+    if _should_skip_container_guards(env_type, has_host_access=has_host_access) and not manual_review:
         return _user_deny_block(command) or _approved()
 
     blocked = _floor_block(command, sudo_guard=True)
     if blocked is not None:
         return blocked
 
-    from agent.terminal_approval_batch import consume_prepared_guard
-    prepared = consume_prepared_guard(command, env_type, has_host_access)
-    if prepared is not None:
-        return prepared
+    if not manual_review:
+        from agent.terminal_approval_batch import consume_prepared_guard
+        prepared = consume_prepared_guard(command, env_type, has_host_access)
+        if prepared is not None:
+            return prepared
 
     approval_mode = approval_context._get_approval_mode()
-    if _yolo_active() or approval_mode == "off":
+    if not manual_review and (_yolo_active() or approval_mode == "off"):
         return _approved()
-    if _command_matches_permanent_allowlist(command):
+    if not manual_review and _command_matches_permanent_allowlist(command):
         return _approved()
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
-    # Outside CLI/gateway/ask flows we never block on approvals: each
-    # unattended context applies its configured deny/approve mode, else allow.
     if not is_cli and not is_gateway and not is_ask:
+        if manual_review:
+            review_key, review_description = required_review
+            return _blocked(
+                "BLOCKED: A lifecycle-scan uncertainty requires a human approval, but "
+                "no interactive user or approval bridge is available. Do NOT retry unattended.",
+                pattern_key=review_key,
+                description=review_description,
+            )
+        # Outside CLI/gateway/ask flows we never block on approvals: each
+        # unattended context applies its configured deny/approve mode, else allow.
         for ctx in _unattended_contexts():
             result = _unattended_deny(command, ctx)
             if result is not None:
                 return result
         return _approved()
 
-    # Gather findings: warnings = [(pattern_key, description, is_tirith)]. Tirith block AND warn both go through the
-    # approval flow (block used to be a hard stop) so users can inspect the findings and approve.
-    tirith_result = _tirith_scan(command)
-    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    # Gather findings: warnings = [(pattern_key, description, is_tirith/session-only)]. A
+    # mandatory lifecycle review is session-only and is never eligible for smart auto-approval.
     warnings = []
     session_key = get_current_session_key()
+    if required_review is not None:
+        review_key, review_description = required_review
+        if not is_approved(session_key, review_key):
+            warnings.append((review_key, review_description, True))
+
+    # Tirith block AND warn both go through the approval flow (block used to be a hard stop)
+    # so a gateway force=True replay cannot bypass one check when only the other was shown.
+    tirith_result = _tirith_scan(command)
+    is_dangerous, pattern_key, description = detect_dangerous_command(command)
     if tirith_result["action"] in {"block", "warn"}:
         findings = tirith_result.get("findings") or []
         rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
@@ -1220,16 +1265,18 @@ def check_all_command_guards(command: str, env_type: str,
     combined_desc = "; ".join(desc for _, desc, _ in warnings)
     primary_key = warnings[0][0]
     all_keys = [key for key, _, _ in warnings]
-
-    # "Always" is offered when at least one warning is a dangerous-pattern key the persistence layer would actually
-    # allowlist permanently. Pure-tirith findings are session-max by design, so a tirith-only prompt hides Always;
-    # mixed prompts offer it (the pattern key persists, tirith downgrades to session — see _persist_choice).
+    # A lifecycle review cannot be widened into a reusable approval, even if combined with
+    # another warning. The user sees the complete command and all findings in one prompt.
+    permanent_capable = not manual_review and any(not is_t for _, _, is_t in warnings)
+    session_capable = not manual_review
     return _human_decision(
         _COMMAND_GATE, command=command, description=combined_desc,
         pattern_key=primary_key, pattern_keys=all_keys, warnings=warnings,
         session_key=session_key, approval_callback=approval_callback,
-        is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask, smart=approval_mode == "smart",
-        permanent_capable=any(not is_t for _, _, is_t in warnings),
+        is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
+        smart=approval_mode == "smart" and not manual_review,
+        permanent_capable=permanent_capable,
+        session_capable=session_capable,
     )
 
 
