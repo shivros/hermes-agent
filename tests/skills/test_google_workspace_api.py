@@ -195,6 +195,33 @@ def test_api_get_credentials_refresh_persists_authorized_user_type(api_module, m
     assert isinstance(creds, FakeCredentials)
     assert saved["token"] == "ya29.refreshed"
     assert saved["type"] == "authorized_user"
+    assert saved["client_id"] == "123.apps.googleusercontent.com"
+    assert saved["client_secret"] == "secret"
+    assert saved["token_uri"] == "https://oauth2.googleapis.com/token"
+
+
+def test_repair_token_file_restores_metadata_after_external_rewrite(api_module, tmp_path):
+    token_path = api_module.TOKEN_PATH
+    client_secret_path = api_module.CLIENT_SECRET_PATH
+    client_secret_path.write_text(json.dumps({
+        "installed": {
+            "client_id": "123.apps.googleusercontent.com",
+            "client_secret": "client-secret",
+        }
+    }), encoding="utf-8")
+    token_path.write_text(json.dumps({
+        "access_token": "ya29.external",
+        "refresh_token": "1//refresh",
+    }), encoding="utf-8")
+
+    api_module._repair_token_file()
+
+    repaired = json.loads(token_path.read_text(encoding="utf-8"))
+    assert repaired["token"] == "ya29.external"
+    assert repaired["client_id"] == "123.apps.googleusercontent.com"
+    assert repaired["client_secret"] == "client-secret"
+    assert repaired["token_uri"] == "https://oauth2.googleapis.com/token"
+    assert repaired["type"] == "authorized_user"
 
 
 def test_gmail_search_empty_result_prints_json_array(

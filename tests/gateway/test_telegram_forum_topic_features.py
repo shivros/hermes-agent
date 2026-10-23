@@ -2,7 +2,7 @@
 
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -47,6 +47,27 @@ def test_dm_topics_keep_the_existing_topic_mode_gate():
     assert not runner._is_telegram_renamable_topic(_source("dm", "42"))
     runner._telegram_topic_mode_enabled = lambda source: True
     assert runner._is_telegram_renamable_topic(_source("dm", "42"))
+
+
+def test_forum_topic_auto_title_registers_rename_callback(monkeypatch):
+    from gateway import run_turn_progress
+
+    monkeypatch.setattr(run_turn_progress, "local_viewer_turn", lambda _turn: False)
+    turn = cast(Any, object.__new__(run_turn_progress.GatewayTurnProgressMixin))
+    runner = _runner()
+    source = _source("forum", "42")
+    runner._recover_discord_auto_thread_source = lambda _source, _key: source
+    runner._schedule_telegram_topic_title_rename = MagicMock()
+    turn._runner = runner
+    turn._ctx = SimpleNamespace(source=source, session_key="agent:main:telegram:forum:-100123:42")
+    agent = SimpleNamespace(session_id="session-1")
+
+    turn._attach_session_title_callback(agent, turn._ctx)
+    agent._on_session_title("Forum Topic", "llm")
+
+    runner._schedule_telegram_topic_title_rename.assert_called_once_with(
+        source, "session-1", "Forum Topic",
+    )
 
 
 @pytest.mark.asyncio
