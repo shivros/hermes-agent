@@ -560,7 +560,7 @@ def _budget_exhausted(budget: _LifecycleScanBudget, what: str, depth: int) -> bo
     return True
 
 
-def _unreadable_reason(path: Path) -> str:
+def _unreadable_reason(path: Path, *, max_bytes: Optional[int] = None) -> str:
     """Name why an *executed* script failed closed without being scanned (live SQLite, device,
     oversized). Message-only: the fail-closed verdict itself came from the bounded reader."""
     from hermes_cli.sqlite_safe_read import has_live_connection
@@ -573,7 +573,12 @@ def _unreadable_reason(path: Path) -> str:
         return f"`{path}` could not be read"
     if not stat.S_ISREG(metadata.st_mode):
         return f"`{path}` is not a regular file"
-    return f"`{path}` is larger than the scan cap ({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget"
+    if metadata.st_size > _MAX_REFERENCED_SCRIPT_BYTES:
+        return f"`{path}` is larger than the scan cap ({_MAX_REFERENCED_SCRIPT_BYTES} bytes)"
+    byte_limit = _capped_read_limit(max_bytes)
+    if metadata.st_size > byte_limit:
+        return f"`{path}` exceeds the remaining walk budget ({byte_limit} bytes)"
+    return f"`{path}` could not be read within the scan limits"
 
 
 def _refuse_unreadable(budget: _LifecycleScanBudget, path: Path, reason: str) -> bool:
@@ -1153,7 +1158,9 @@ def _contains_unsafe_gateway_action(
         script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
         if unsafe:
             if candidate_executed:
-                return _refuse_unreadable(budget, script_path, _unreadable_reason(script_path))
+                return _refuse_unreadable(
+                    budget, script_path, _unreadable_reason(script_path, max_bytes=budget.bytes_remaining)
+                )
             continue
         if script_text is None and read_remote_script is not None:
             # Local path missing; the remote backend's output crosses the same trust boundary as a
@@ -1167,11 +1174,14 @@ def _contains_unsafe_gateway_action(
             )
             if unsafe:
                 if candidate_executed:
-                    return _refuse_unreadable(
-                        budget, script_path,
-                        f"`{script_path}` read from the backend exceeds the scan cap "
-                        f"({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget",
-                    )
+                    if budget.bytes_remaining < _MAX_REFERENCED_SCRIPT_BYTES:
+                        reason = f"`{script_path}` exceeds the remaining walk budget ({budget.bytes_remaining} bytes)"
+                    else:
+                        reason = (
+                            f"`{script_path}` read from the backend exceeds the scan cap "
+                            f"({_MAX_REFERENCED_SCRIPT_BYTES} bytes)"
+                        )
+                    return _refuse_unreadable(budget, script_path, reason)
                 continue
         if not script_text:
             continue

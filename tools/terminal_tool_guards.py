@@ -9,11 +9,13 @@ module re-imports every public helper so ``tools.terminal_tool.<name>``
 keeps resolving.
 """
 
+import hashlib
 import json
 import logging
 import re
 import shlex
 import stat
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -62,6 +64,14 @@ def _safe_command_preview(command: Any, limit: int = 200) -> str:
 def _blocked_json(error: str, status: str) -> str:
     """The guard result envelope: exit_code 1 + *error* + *status*."""
     return json.dumps({"output": "", "exit_code": 1, "error": error, "status": status}, ensure_ascii=False)
+
+
+@dataclass(frozen=True)
+class LifecycleScanReview:
+    """A referenced script could not be inspected and needs explicit user approval."""
+
+    pattern_key: str
+    description: str
 
 
 _SHELL_LEVEL_BACKGROUND_RE = re.compile(
@@ -252,6 +262,11 @@ def _read_script_for_guard(env: Any, guard_cwd: str, script_path: str, max_bytes
     return None
 
 
+def _is_oversized_referenced_script_refusal(refusal: str) -> bool:
+    """The local size cap is reviewable; unreadable paths and whole-walk limits remain fail-closed."""
+    return "larger than the scan cap" in refusal or "exceeds the scan cap" in refusal
+
+
 def gateway_lifecycle_block(
     *,
     command: str,
@@ -260,19 +275,16 @@ def gateway_lifecycle_block(
     cwd: str,
     workdir: Optional[str],
     session_key: str,
-) -> Optional[str]:
-    """Refuse gateway lifecycle commands issued from inside the supervised gateway.
+) -> Optional[str | LifecycleScanReview]:
+    """Refuse known lifecycle commands and review an inconclusive referenced-script scan.
 
     ``systemctl``/``launchctl``/``hermes gateway restart|stop|uninstall``
     targeting hermes-gateway would SIGTERM the gateway — and this very
     subprocess — before completing, so the service may never come back.
-    Applies unconditionally (``force=True`` cannot bypass it). Gated on the
-    SUPERVISED-gateway probe, not the raw ``_HERMES_GATEWAY`` marker: that
-    marker leaks into every process that merely imports gateway.run (hermes
-    serve, CLI, web server), which must still be able to restart the gateway;
-    an unsupervised foreground ``hermes gateway run`` has no KeepAlive to turn
-    a self-restart into a respawn loop, so it passes too.
-    Returns the JSON error string when blocked, else None.
+    Known lifecycle matches remain unconditional blocks. If the bounded walk
+    cannot inspect an executed reference, return a one-shot review request rather
+    than misreporting that a lifecycle command was found. Gated on the
+    SUPERVISED-gateway probe, not the raw ``_HERMES_GATEWAY`` marker.
     """
     from tools.process_registry import _is_supervised_gateway_process
     from tools.terminal_tool import _resolve_command_cwd, get_session_cwd
@@ -314,14 +326,22 @@ def gateway_lifecycle_block(
         read_remote_script=lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES),
     )
     if unsafe and refusal:
-        # Not a lifecycle command: a script the command EXECUTES could not be scanned (budget,
-        # size, device, live SQLite, cloud placeholder). Say so, or the model rewords and retries
-        # the same command in a loop (#113944).
+        if _is_oversized_referenced_script_refusal(refusal):
+            # The 1 MiB per-file cap is deliberately conservative, not evidence of a lifecycle action.
+            # Require an explicit one-shot decision for this exact command; other uninspectable
+            # cases (devices, live databases, cloud placeholders, total-work limits) stay blocked.
+            key = hashlib.sha256(f"{command}\0{refusal}".encode()).hexdigest()[:16]
+            return LifecycleScanReview(
+                pattern_key=f"gateway_lifecycle_unscannable:{key}",
+                description=(
+                    "Lifecycle scan uncertainty: a referenced script exceeded the 1 MiB size limit. "
+                    "It may contain a gateway stop/restart command. Approve this exact command once to proceed."
+                ),
+            )
         return _blocked_json(
             f"Blocked: the lifecycle guard could not scan this command or referenced script: {refusal}. "
-            "Nothing in the command is known to contain a gateway lifecycle command, but a "
-            "script the command executes must be scannable (a regular text file under 1 MiB) "
-            "before it can run inside the gateway process.",
+            "No gateway lifecycle action was confirmed, but executed scripts must be scannable within the "
+            "guard's safety limits before they can run inside the gateway process.",
             "error",
         )
     if unsafe:

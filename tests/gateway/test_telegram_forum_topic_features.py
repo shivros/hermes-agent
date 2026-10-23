@@ -50,6 +50,23 @@ def test_dm_topics_keep_the_existing_topic_mode_gate():
 
 
 @pytest.mark.asyncio
+async def test_dm_topic_rename_keeps_existing_topic_mode_behavior():
+    runner = _runner()
+    runner._telegram_topic_mode_enabled = lambda source: True
+    adapter = SimpleNamespace(rename_dm_topic=AsyncMock())
+    runner._delivery_adapter_for = lambda source: adapter
+    runner._sanitize_telegram_topic_title = lambda title: title
+
+    await runner._rename_telegram_topic_for_session_title(
+        _source("dm", "42"), "session-1", "DM Topic"
+    )
+
+    adapter.rename_dm_topic.assert_awaited_once_with(
+        chat_id="-100123", thread_id="42", name="DM Topic",
+    )
+
+
+@pytest.mark.asyncio
 async def test_forum_topic_rename_retries_one_telegram_retry_after(monkeypatch):
     class RetryAfterError(RuntimeError):
         retry_after: float = 3

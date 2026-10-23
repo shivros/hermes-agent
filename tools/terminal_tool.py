@@ -161,11 +161,15 @@ def _docker_has_host_access(config: dict[str, Any]) -> bool:
 
 
 def _check_all_guards(command: str, env_type: str,
-                      has_host_access: bool = False) -> dict:
-    """Delegate to the consolidated command guard with the CLI callback."""
-    return _check_all_guards_impl(command, env_type,
-                                  approval_callback=_get_approval_callback(),
-                                  has_host_access=has_host_access)
+                      has_host_access: bool = False,
+                      required_review: Optional[tuple[str, str]] = None) -> dict:
+    """Delegate to the consolidated command guard, carrying any required one-shot review."""
+    guard_kwargs: dict[str, Any] = {"has_host_access": has_host_access}
+    if required_review is not None:
+        guard_kwargs["required_review"] = required_review
+    return _check_all_guards_impl(
+        command, env_type, approval_callback=_get_approval_callback(), **guard_kwargs,
+    )
 
 
 from tools.environments.base import EnvironmentConnectionError
@@ -919,7 +923,7 @@ def _command_requires_pipe_stdin(command: str) -> bool:
 
 
 from tools.terminal_tool_guards import (
-    _foreground_background_guidance, _safe_command_preview, _validate_workdir,
+    LifecycleScanReview, _foreground_background_guidance, _safe_command_preview, _validate_workdir,
     gateway_lifecycle_block, self_repo_block, trailing_amp_background_command,
 )
 from tools.terminal_tool_background import _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
@@ -1080,13 +1084,24 @@ class _ApprovalVerdict:
     approved_run: bool = False
 
 
-def _run_approval_guards(command: str, env_type: str, config: dict[str, Any], *, force: bool) -> _ApprovalVerdict:
-    """Run the command guards; ``force`` skips them entirely.
-    Raises :class:`_Rejected` when the command may not run (denied, or pending
-    gateway approval)."""
+def _run_approval_guards(
+    command: str,
+    env_type: str,
+    config: dict[str, Any],
+    *,
+    force: bool,
+    required_review: Optional[LifecycleScanReview] = None,
+) -> _ApprovalVerdict:
+    """Run terminal approvals; ``force`` means the user already confirmed this command."""
     if force:
         return _ApprovalVerdict(approved_run=True)
-    approval = _check_all_guards(command, env_type, has_host_access=_docker_has_host_access(config))
+    review = (required_review.pattern_key, required_review.description) if required_review else None
+    approval = _check_all_guards(
+        command,
+        env_type,
+        has_host_access=_docker_has_host_access(config),
+        required_review=review,
+    )
     if not approval["approved"]:
         if approval.get("status") == "pending_approval":  # gateway ask mode
             raise _Rejected(_error_json(
@@ -1097,6 +1112,7 @@ def _run_approval_guards(command: str, env_type: str, config: dict[str, Any], *,
                 pattern_key=approval.get("pattern_key", ""),
                 smart_denied=approval.get("smart_denied", False),
                 allow_permanent=approval.get("allow_permanent", True),
+                allow_session=approval.get("allow_session", True),
             ))
         desc = approval.get("description", "command flagged")
         fallback_msg = (
@@ -1382,16 +1398,13 @@ _PRE_EXEC_GUARD_MIN_TIMEOUT_S = 30
 def _pre_exec_block(
     command: str, *, env: Any, env_type: str, cwd: str,
     workdir: Optional[str], session_key: str,
-) -> None:
-    """Raise :class:`_Rejected` with the blocked-result JSON when the command must not run.
-
-    Order matters: gateway lifecycle first (protects the running gateway),
-    then the dangerous-workdir check, then the self-repo guard (local only).
-    """
+) -> Optional[LifecycleScanReview]:
+    """Raise on detected lifecycle actions and return review requests after the other pre-exec guards."""
     blocked = gateway_lifecycle_block(
         command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
     )
-    if blocked:
+    lifecycle_review = blocked if isinstance(blocked, LifecycleScanReview) else None
+    if isinstance(blocked, str) and blocked:
         raise _Rejected(blocked)
     if workdir:
         workdir_error = _validate_workdir(workdir)
@@ -1403,6 +1416,7 @@ def _pre_exec_block(
         blocked = self_repo_block(command=command, cwd=cwd, workdir=workdir, session_key=session_key)
         if blocked:
             raise _Rejected(blocked)
+    return lifecycle_review
 
 
 _PTY_DISABLED_REASON = (
@@ -1523,9 +1537,14 @@ def terminal_tool(
                 "(process-identity probe wedged); the command was not run. Retry the call.",
                 status="error",
             ))
-        # Pre-exec security checks (floors + dangerous command detection);
-        # force=True means the user already confirmed.
-        verdict = _run_approval_guards(command, env_type, plan.config, force=force)
+        lifecycle_review = bounded_guard.value
+        if not isinstance(lifecycle_review, LifecycleScanReview):
+            lifecycle_review = None
+        # Pre-exec security checks; the lifecycle-scan uncertainty is part of
+        # the same human decision and cannot be auto-approved by smart/yolo/off.
+        verdict = _run_approval_guards(
+            command, env_type, plan.config, force=force, required_review=lifecycle_review,
+        )
 
         pty_disabled = pty and _command_requires_pipe_stdin(command)
         if plan.promoted_from_foreground_timeout is not None:
