@@ -98,6 +98,14 @@ def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, 
                   owner_task_id=task_id or effective_task_id, session_key=session_key,
                   persist_on_release=persist_on_release)
     if env_type == "local":
+        # spawn_local starts in the nearest usable ancestor when cwd cannot be entered
+        # (process_registry._resolve_safe_cwd). A named workdir or a reviewed script must not
+        # run from a directory nobody chose or reviewed, so refuse here, before a process exists:
+        # the answer execute(allow_cwd_fallback=False) already gives on the environment backends.
+        from tools.environments.local import _cwd_usable, _msys_to_windows_path
+        if not allow_cwd_fallback and cwd and not _cwd_usable(_msys_to_windows_path(cwd)):
+            raise FileNotFoundError(
+                f"cwd is not a usable directory and no fallback is allowed: {cwd}")
         return process_registry.spawn_local(
             env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty,
             restore_login_path=True, **common)
@@ -160,6 +168,7 @@ def spawn_background_process(
     persist_on_release: bool = False,
     mounted_host: Optional[str] = None,
     auto_backgrounded: bool = False,
+    required_review=None,
 ) -> str:
     """Spawn *command* as a tracked background process and return the JSON result.
 
@@ -179,12 +188,19 @@ def spawn_background_process(
         mounted_host=mounted_host if mounted_host is not None else getattr(env, "host_cwd", None),
         env=env,
     )
+    # Resolve and validate at the final consumer, then dispatch that exact local value. The
+    # session cwd may have changed while approval or the background handoff was in progress.
+    if required_review is not None and not required_review.valid_for(command, effective_cwd):
+        from tools.terminal_tool import _error_json
+        return _error_json(
+            "Blocked: reviewed script identity/content or cwd changed; obtain a fresh review.", status="blocked")
     try:
         proc_session = _spawn(
             process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
             effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
             effective_pty=effective_pty, persist_on_release=persist_on_release,
-            allow_cwd_fallback=not workdir,  # a named workdir is refused, never swapped for a parent
+            # a named workdir is refused, never swapped for a parent; neither is a reviewed cwd
+            allow_cwd_fallback=not workdir and required_review is None,
         )
         result_data = {"output": "Background process started", "session_id": proc_session.id,
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
