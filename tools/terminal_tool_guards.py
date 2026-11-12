@@ -564,7 +564,7 @@ def _review_file_identity(path: Path, *, max_bytes: int = 64 * 1024 * 1024) -> t
     files. Hashing is bounded at 64 MiB across a review to avoid a sparse-file denial of service.
     """
     from cron.lifecycle_guard import _on_cloud_path
-    from hermes_cli.sqlite_safe_read import has_live_connection
+    from hermes_cli.sqlite_safe_read import LiveConnectionError, has_live_connection, offline_file_access
 
     if _on_cloud_path(path) or has_live_connection(path):
         raise ValueError("unreviewable path")
@@ -573,20 +573,26 @@ def _review_file_identity(path: Path, *, max_bytes: int = 64 * 1024 * 1024) -> t
     if not stat.S_ISREG(metadata.st_mode):
         raise ValueError("not a regular file")
     # A FIFO replacement after stat must not hang the tool thread.
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
-    with os.fdopen(descriptor, "rb", buffering=0) as source:
-        before = os.fstat(source.fileno())
-        if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
-            raise ValueError("unreviewable size or file type")
-        digest = hashlib.sha256()
-        remaining = before.st_size + 1
-        while remaining:
-            chunk = source.read(min(65536, remaining))
-            if not chunk:
-                break
-            remaining -= len(chunk)
-            digest.update(chunk)
-        after = os.fstat(source.fileno())
+    try:
+        # The early live check is only a fast refusal. Own the connection lifecycle through
+        # close(): a connection opened in between must not lose its process-wide POSIX locks.
+        with offline_file_access(path, what="hash for lifecycle review"):
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+            with os.fdopen(descriptor, "rb", buffering=0) as source:
+                before = os.fstat(source.fileno())
+                if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
+                    raise ValueError("unreviewable size or file type")
+                digest = hashlib.sha256()
+                remaining = before.st_size + 1
+                while remaining:
+                    chunk = source.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    digest.update(chunk)
+                after = os.fstat(source.fileno())
+    except LiveConnectionError as exc:
+        raise ValueError("live database is not reviewable") from exc
     def identity(s):
         return (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
     if identity(before) != identity(after) or identity(after) != identity(path.stat()):

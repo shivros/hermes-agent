@@ -16,6 +16,7 @@ import hashlib
 import importlib
 import logging
 import os
+import secrets
 import threading
 from typing import Any, Iterable, Optional
 
@@ -162,13 +163,16 @@ def resolve_gateway_approval(session_key: str, choice: str,
         if not queue:
             return 0
         if request_id:
-            targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
+            targets = [entry for entry in queue if entry.data.get("request_id") == request_id
+                       and (not resolve_all or choice == "deny" or not entry.data.get("once_only"))]
             if not targets:
                 return 0
             queue[:] = [entry for entry in queue if entry not in targets]
         elif resolve_all:
-            targets = list(queue)
-            queue.clear()
+            # A blanket grant is not fresh consent for any mandatory one-shot invocation.
+            # Deny-all still withdraws everything; ordinary broad-scope approvals are unchanged.
+            targets = [entry for entry in queue if choice == "deny" or not entry.data.get("once_only")]
+            queue[:] = [entry for entry in queue if entry not in targets]
         else:
             targets = [queue.pop(0)]
         if not queue:
@@ -1016,6 +1020,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                 "allow_permanent": not limited_scope,
                 "allow_session": not limited_scope,
             }
+            if once_only:
+                data["once_only"] = True
             if smart_denied:
                 data["smart_denied"] = True
             decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway")
@@ -1333,7 +1339,9 @@ def check_all_command_guards(command: str, env_type: str,
         # Include current findings even if a cache/allowlist/batch grant covers them. The mandatory
         # exception always needs fresh consent, with the complete current approval provenance intact.
         findings = _command_findings(command)
-        key = "lifecycle_file_size:" + hashlib.sha256(required_review.description.encode()).hexdigest()
+        # Correlation, not a reusable content grant: identical concurrent invocations must
+        # never coalesce or let one older client's session/always reply release both waits.
+        key = "lifecycle_file_size:" + secrets.token_hex(32)
         keys = [key] + [k for k, _ in findings]
         description = required_review.description + "; " + "; ".join(text for _, text in findings)
         return _human_decision(

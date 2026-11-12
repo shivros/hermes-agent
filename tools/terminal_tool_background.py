@@ -159,6 +159,7 @@ def spawn_background_process(
     persist_on_release: bool = False,
     mounted_host: Optional[str] = None,
     auto_backgrounded: bool = False,
+    required_review=None,
 ) -> str:
     """Spawn *command* as a tracked background process and return the JSON result.
 
@@ -178,6 +179,12 @@ def spawn_background_process(
         mounted_host=mounted_host if mounted_host is not None else getattr(env, "host_cwd", None),
         env=env,
     )
+    # Resolve and validate at the final consumer, then dispatch that exact local value. The
+    # session cwd may have changed while approval or the background handoff was in progress.
+    if required_review is not None and not required_review.valid_for(command, effective_cwd):
+        from tools.terminal_tool import _error_json
+        return _error_json(
+            "Blocked: reviewed script identity/content or cwd changed; obtain a fresh review.", status="blocked")
     try:
         proc_session = _spawn(
             process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
