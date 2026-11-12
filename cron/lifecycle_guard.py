@@ -522,10 +522,35 @@ class LifecycleReviewScan:
         self.dynamic_cwd = False
 
     def note_text(self, text: str) -> None:
-        # This narrow exception does not model shell/interpreter directory changes. A literal
-        # change in known code makes file binding ambiguous; keep it blocked, even in prose.
-        self.dynamic_cwd = self.dynamic_cwd or bool(re.search(
-            r"\b(?:cd|pushd|popd|chdir|fchdir)\b|--chdir|\benv\s+-C\b", text))
+        self.dynamic_cwd = self.dynamic_cwd or _changes_directory(text)
+
+
+# A literal directory change in scanned text. Review cannot bind file identities behind it and
+# refuses; the walk must resolve relative references from the wrapper's own directory as well.
+# `autocd` turns a bare directory name into a cd, so there is no cd token to see.
+_DIRECTORY_CHANGE_RE = re.compile(
+    r"\b(?:cd|pushd|popd|chdir|fchdir)\b|--chdir|\benv\s+-C\b|(?i:autocd)")
+
+
+def _changes_directory(text: str) -> bool:
+    """Whether *text* contains a literal directory change.
+
+    Deliberately over-inclusive (prose, comments and unrelated ``cd`` usages count): a false
+    positive only costs one more bounded scan, while a false negative would hide a reference.
+    """
+    return bool(_DIRECTORY_CHANGE_RE.search(text))
+
+
+# A sourced file (`source F` / `. F`) runs in the wrapper's own shell: its `cd "$(dirname "$0")"`
+# moves the wrapper before the wrapper's next relative reference. Deliberately over-inclusive like
+# _DIRECTORY_CHANGE_RE; a bare `.` used as an argument merely costs one more bounded scan.
+_SOURCE_RE = re.compile(r"(?<![\w./-])(?:source|\.)\s")
+
+
+def _may_resolve_from_own_directory(text: str) -> bool:
+    """Whether *text* can reach a relative reference from its own directory rather than the
+    inherited cwd: it changes directory itself, or it sources a file that may."""
+    return bool(_DIRECTORY_CHANGE_RE.search(text) or _SOURCE_RE.search(text))
 
 
 class _LifecycleScanBudget:
@@ -1098,6 +1123,60 @@ def _resolve_lenient(path: Path) -> Path:
         return path
 
 
+def _cwd_identity(cwd: Optional[str]) -> Optional[str]:
+    """Key for the directory a scan resolves relative references from. ``None`` is the process cwd
+    (the default ``_resolved_or_nothing`` applies); symlinks and trailing slashes are normalised so
+    two spellings of one directory are one directory. Never raises."""
+    try:
+        return str(_resolve_lenient(Path(cwd) if cwd else Path.cwd()))
+    except (OSError, RuntimeError, ValueError):
+        return cwd or None
+
+
+def _cwd_is_usable(cwd: Optional[str]) -> bool:
+    """Whether the shell can read a relative reference from *cwd* at all. A cwd spelled through a
+    missing component (``d/missing/..``) names a real directory once normalised, but nothing can be
+    read from it. Never raises."""
+    try:
+        return os.path.isdir(cwd) if cwd else True
+    except (OSError, ValueError):
+        return False
+
+
+# One scanned script: its resolved path, the directory it was scanned from, and whether that
+# encounter executes it.
+_ScanNode = tuple[Path, Optional[str], bool]
+
+
+def _node_scanned(scanned: set[_ScanNode], node: _ScanNode) -> bool:
+    """Whether *node*'s script was already scanned at least as strictly as this encounter asks.
+    An executed scan covers a later mention of the same script in the same directory. A mention scan
+    never covers an executed encounter: for a mention, "could not scan" is nothing to scan, so a
+    helper refused or starved there still owes its fail-closed verdict once it is executed."""
+    resolved, directory, executed = node
+    if node in scanned:
+        return True
+    return not executed and (resolved, directory, True) in scanned
+
+
+def _settle_encounter(scanned: set[_ScanNode], node: _ScanNode, executed: bool) -> None:
+    """Record a refused encounter once it is settled. An EXECUTED one is settled at this
+    strictness (refused for good, or recorded for review) and covers a later mention of the same
+    script in the same directory. A refused MENTION stays unread and covers nothing: it still owes
+    its fail-closed verdict once the script is executed."""
+    if executed:
+        scanned.add(node)
+
+
+def _settle_nothing_to_scan(scanned: set[_ScanNode], resolved: Path, cwd: Optional[str]) -> None:
+    """Record a read that found nothing to scan (absent or empty) as settled at every strictness,
+    so a repeated script costs one path from the walk budget exactly as it does upstream. Only a
+    read from a USABLE directory establishes that: from an unusable cwd spelling nothing was
+    actually looked at, and the wrapper's own-directory pass must still get its turn."""
+    if _cwd_is_usable(cwd):
+        scanned.add((resolved, _cwd_identity(cwd), True))
+
+
 def _is_cloud_placeholder_path(path: Path) -> bool:
     """True for paths inside a macOS FileProvider-backed subtree. ``O_NONBLOCK`` does not make
     regular-file reads non-blocking, so opening an evicted placeholder can wait indefinitely for
@@ -1176,6 +1255,17 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def _own_directory_pass(text: str, cwd: Optional[str], directory: Optional[str]) -> Optional[str]:
+    """The directory a second scan of *text* has to start from, or ``None`` when the scan from
+    *cwd* already covers every resolution the shell can perform: *directory* unknown, the same
+    directory under another spelling the shell can read from, or *text* that cannot move the shell
+    to its own directory."""
+    same_directory = _cwd_identity(directory) == _cwd_identity(cwd) and _cwd_is_usable(cwd)
+    if directory is None or same_directory:
+        return None
+    return directory if _may_resolve_from_own_directory(text) else None
 
 
 # --- referenced-script discovery --------------------------------------------------------------
@@ -1330,7 +1420,7 @@ def _has_binary_magic(data: bytes) -> bool:
 
 
 def _read_referenced_script(
-    path: Path, *, max_bytes: Optional[int] = None
+    path: Path, *, max_bytes: Optional[int] = None, strict_io: bool = False
 ) -> tuple[Optional[str], bool]:
     """Read a referenced script without racing SQLite connection lifecycle.
 
@@ -1338,21 +1428,28 @@ def _read_referenced_script(
     sequence. A separate ``has_live_connection`` check would leave a race in
     which another thread opens SQLite after the check but before this function
     closes its descriptor, cancelling that connection's POSIX locks.
+
+    ``strict_io`` preserves scanner failures for review discovery: the scan boundary refuses
+    them instead of mistaking them for binary/non-script inputs or retrying through a backend.
     """
     from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
 
     try:
         with offline_file_access(path, what="read referenced script"):
-            return _read_referenced_script_unlocked(path, max_bytes=max_bytes)
+            return _read_referenced_script_unlocked(path, max_bytes=max_bytes, strict_io=strict_io)
     except LiveConnectionError:
         return None, True
-    except (OSError, ValueError):
+    except OSError:
+        if strict_io:
+            raise
+        return None, False
+    except ValueError:
         # Invalid path values, including embedded NULs, are not scripts.
         return None, False
 
 
 def _read_referenced_script_unlocked(
-    path: Path, *, max_bytes: Optional[int] = None
+    path: Path, *, max_bytes: Optional[int] = None, strict_io: bool = False
 ) -> tuple[Optional[str], bool]:
     """Return ``(text, unsafe)`` using bounded, regular-file-only reads.
 
@@ -1369,9 +1466,16 @@ def _read_referenced_script_unlocked(
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except (OSError, ValueError):
-        # OSError: unreadable/missing/over-long. ValueError: embedded NUL in *path*. Either is
-        # "nothing to scan" — never crash the guard.
+    except (FileNotFoundError, NotADirectoryError):
+        # An absent local candidate can still be read by a remote backend. Review identity
+        # capture requires every discovered path to exist locally, so this cannot grant review.
+        return None, False
+    except OSError:
+        if strict_io:
+            raise
+        return None, False
+    except ValueError:
+        # Embedded NUL in a tokenized path is not a script.
         return None, False
     try:
         # ValueError: an embedded NUL byte in *path* itself — a binary's decoded bytes tokenized into a
@@ -1403,6 +1507,8 @@ def _read_referenced_script_unlocked(
                 break
             data += chunk
     except OSError:
+        if strict_io:
+            raise
         return None, False
     finally:
         os.close(descriptor)
@@ -1457,6 +1563,7 @@ def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
 
 def _scan_written_bodies(
     bodies: list[str], recurse: Callable[..., bool], cwd: Optional[str], executed: bool,
+    target_directory: Optional[str] = None,
 ) -> bool:
     """Scan the heredoc bodies written to one run path. Each body is one possible file version (an
     overwrite replaces the last); their concatenation is the file ``>>`` appends build. Joined
@@ -1464,11 +1571,39 @@ def _scan_written_bodies(
     is never scanned alone. A body is a substring of charged text (charge_text frees its first
     scan only); the join is new text, so it is charged like any other. A script built from large
     ``>>`` appends therefore costs about twice its size: one near half the walk budget fails
-    closed on the budget refusal."""
+    closed on the budget refusal.
+
+    *target_directory* is the directory of the path the bodies are written to. Once a body runs
+    as that file its ``cd "$(dirname "$0")"`` moves the shell there like any script read from
+    disk, so a body that can move the shell is also scanned from that directory. That second scan
+    is a repeat of a written body and is charged like one (the same text, resolving from somewhere
+    else), so a large written script run behind a cd-wrapper fails closed on the budget refusal
+    that much sooner."""
     bodies = list(dict.fromkeys(filter(None, bodies)))
-    if any(recurse(body, cwd, executed, charge=False) for body in bodies):
-        return True
-    return len(bodies) > 1 and recurse("".join(bodies), cwd, executed)
+    versions = [(body, False) for body in bodies]
+    if len(bodies) > 1:
+        versions.append(("".join(bodies), True))
+    for text, charged in versions:
+        if recurse(text, cwd, executed, charge=charged):
+            return True
+        own_directory = _own_directory_pass(text, cwd, target_directory)
+        if own_directory is not None and recurse(text, own_directory, executed, charge=False):
+            return True
+    return False
+
+
+def _unscanned_written_bodies_are_unsafe(
+    written: dict[Path, list[str]], scanned_writes: set[_ScanNode], node: _ScanNode,
+    recurse: Callable[..., bool], cwd: Optional[str], executed: bool,
+) -> bool:
+    """Scan the heredoc bodies written to *node*'s path once per (path, directory, executed) node:
+    the scan from a wrapper's own directory sees them again like any other script read there, and
+    an executed encounter is never covered by a mention scan (see _node_scanned)."""
+    if _node_scanned(scanned_writes, node):
+        return False
+    scanned_writes.add(node)
+    return _scan_written_bodies(
+        written.get(node[0], []), recurse, cwd, executed, str(node[0].parent))
 
 
 def _collect_oversized_review(budget: _LifecycleScanBudget, reason: str) -> bool:
@@ -1486,11 +1621,36 @@ def _unreadable_script_blocks(budget: _LifecycleScanBudget, path: Path, executed
     if _collect_oversized_review(budget, reason):
         return False
     return _refuse_unreadable(budget, path, reason)
+
+
+def _script_text_is_unsafe(
+    recurse: Callable[..., bool], script_text: str, resolved: Path,
+    cwd: Optional[str], candidate_executed: bool,
+) -> bool:
+    """Scan a readable script's text from every directory its relative references can resolve
+    from. Executed and sourced shells inherit cwd: opening a wrapper does not chdir to its parent,
+    so the text is first scanned from *cwd* (upstream scanned only the script's own directory and
+    missed this). A wrapper that then changes directory, itself or through a file it sources,
+    resolves its next relative references from there, and the usual target is its own directory
+    (``cd "$(dirname "$0")" && bash inner.sh``), which the inherited-cwd scan cannot see, so its
+    text is scanned once more from the wrapper's directory. Review separately rejects known
+    directory changes rather than guessing their effect. The wrapper's own text is not charged
+    again for that pass; every nested read it reveals is charged like any other."""
+    if recurse(script_text, cwd, candidate_executed):
+        return True
+    own_directory = _own_directory_pass(
+        script_text, cwd, _resolve_script_directory(str(resolved)))
+    return own_directory is not None and recurse(
+        script_text, own_directory, candidate_executed, charge=False)
+
+
 def _contains_unsafe_gateway_action(
-    command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
+    command: str, *, cwd: Optional[str], depth: int, visited: set[_ScanNode],
+    budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True,
     written: Optional[dict[Path, list[str]]] = None, charge: bool = True,
     gateway_pid: Optional[int] = None,
+    scanned_writes: set[_ScanNode],
 ) -> bool:
     """``executed=False`` means *command* is the content of a file that is only MENTIONED in inert
     (masked) text: it is still scanned for a literal lifecycle command, but "could not scan" (budget,
@@ -1499,7 +1659,14 @@ def _contains_unsafe_gateway_action(
     *written* maps paths to the heredoc bodies written to them anywhere in the walk so far. It is
     shared by every depth so a nested ``sh -c 'bash P'`` / ``systemd-run bash -c P`` payload still
     resolves P to the body its parent wrote. ``charge=False`` is only for such a body: it is a
-    substring of text already charged, so its first scan is free and any repeat is charged."""
+    substring of text already charged, so its first scan is free and any repeat is charged.
+
+    *visited* (scripts read) and *scanned_writes* (written bodies scanned) are keyed by resolved
+    path, scan directory AND whether the encounter executes the script (_node_scanned): a wrapper
+    is scanned again from its own directory, and every helper that scan reaches is read and charged
+    again there, because its relative references resolve differently once the wrapper has moved the
+    shell. A node is "read" only once a read produced text, or settled an executed encounter: a
+    read that failed (starved, refused for size, missing through this cwd) covered nothing."""
     # Charge BEFORE _direct_lifecycle_scan: every scan in it tokenizes with shlex.
     if not budget.charge_text(command, written_body=not charge):
         return _budget_exhausted(budget, "text", depth) if executed else False
@@ -1510,7 +1677,7 @@ def _contains_unsafe_gateway_action(
         return _contains_unsafe_gateway_action(
             text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
             read_remote_script=read_remote_script, executed=executed, written=written,
-            charge=charge, gateway_pid=gateway_pid,
+            charge=charge, gateway_pid=gateway_pid, scanned_writes=scanned_writes,
         )
 
     if _direct_lifecycle_scan(command) or (
@@ -1541,7 +1708,14 @@ def _contains_unsafe_gateway_action(
     # oversized/binary, budget) stay restricted to the executed view — a mere data mention must not
     # trip them. Executed candidates come first so a mention never starves a real script's budget.
     for script_path, candidate_executed in _walk_candidates(command, walk_command, cwd, executed):
-        if _scan_written_bodies(written.pop(_resolve_lenient(script_path), []), recurse, cwd, candidate_executed):
+        resolved = _resolve_lenient(script_path)
+        # One node per (script, directory, executed): the scan from a wrapper's own directory
+        # reads and charges a helper again even when the inherited-cwd scan already read it
+        # elsewhere, and an executed encounter is never covered by a mention scan.
+        node = (resolved, _cwd_identity(cwd), candidate_executed)
+        if _unscanned_written_bodies_are_unsafe(
+            written, scanned_writes, node, recurse, cwd, candidate_executed
+        ):
             return True
         # Do not touch a FileProvider path even to discover whether the file is hydrated.
         if _on_cloud_path(script_path):
@@ -1552,19 +1726,23 @@ def _contains_unsafe_gateway_action(
                     "~/Library/CloudStorage) that the guard refuses to open",
                 )
             continue
-        resolved = _resolve_lenient(script_path)
         budget.note_path(script_path)
-        if resolved in visited:
+        if _node_scanned(visited, node):
             continue
         if not budget.charge_path():
             if candidate_executed:
                 return _budget_exhausted(budget, "paths", depth)
             break  # remaining candidates are all mentions
-        visited.add(resolved)
         # Never read more than the walk can still afford to tokenize; a file larger than the
         # remainder fails closed exactly like an oversized one.
-        script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
+        # Review must preserve scanner I/O errors, including on oversized files: a later hash
+        # or backend fallback does not prove this read succeeded. The scan boundary fails closed.
+        script_text, unsafe = _read_referenced_script(
+            script_path, max_bytes=budget.bytes_remaining, strict_io=budget.review is not None)
         if unsafe:
+            # Refused for good below, or recorded for review: an executed encounter is settled and
+            # a mention is not (`_settle_encounter`).
+            _settle_encounter(visited, node, candidate_executed)
             if _unreadable_script_blocks(budget, script_path, candidate_executed):
                 return True
             # Keep scanning other references after a reviewable size refusal.
@@ -1576,6 +1754,8 @@ def _contains_unsafe_gateway_action(
                 if candidate_executed:
                     return _budget_exhausted(budget, "remote reads", depth)
                 break
+            # A backend read (a network roundtrip) was spent on this node; never repeat it.
+            visited.add(node)
             script_text, unsafe = _sanitize_remote_script_text(
                 read_remote_script(str(script_path)), max_bytes=budget.bytes_remaining
             )
@@ -1588,9 +1768,13 @@ def _contains_unsafe_gateway_action(
                     )
                 continue
         if not script_text:
+            # Absent or empty. Only a refused read (oversized, device, ...) is left owing its
+            # verdict once executed (`_settle_encounter`).
+            _settle_nothing_to_scan(visited, resolved, cwd)
             continue
-        # Relative references inside a script resolve against that script's directory, not the cwd.
-        if recurse(script_text, _resolve_script_directory(str(resolved)) or cwd, candidate_executed):
+        # Read only now that there is text: a refused read above covered nothing.
+        visited.add(node)
+        if _script_text_is_unsafe(recurse, script_text, resolved, cwd, candidate_executed):
             return True
     return False
 
@@ -1624,7 +1808,7 @@ def scan_gateway_lifecycle(
     budget.review = review
     try:
         unsafe = _contains_unsafe_gateway_action(
-            command, cwd=cwd, depth=0, visited=set(), budget=budget,
+            command, cwd=cwd, depth=0, visited=set(), scanned_writes=set(), budget=budget,
             read_remote_script=read_remote_script, gateway_pid=gateway_pid,
         )
         if not unsafe and review is not None and review.oversized:
