@@ -1010,10 +1010,24 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
     }, True
 
 
+def _unbridged_decision(spec: _GateSpec, session_key: str, *, command: str, description: str,
+                        display: tuple[str, str], pattern_key: str, pattern_keys: list[str],
+                        body, smart_denied: bool, gateway: bool, once_only: bool, one_shot: bool) -> dict:
+    """A deferred force replay is not fresh consent for an unscanned file."""
+    if once_only:
+        return _blocked("BLOCKED: mandatory one-shot review needs a live approval bridge; replay/force is not consent.",
+                        pattern_key=pattern_key, description=description)
+    if spec.pending_keys:
+        command, description = display
+    return _pending_result(spec, session_key, command=command, description=description, pattern_key=pattern_key,
+                           pattern_keys=pattern_keys, body=body, smart_denied=smart_denied, gateway=gateway,
+                           one_shot=one_shot)
+
+
 def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
-                    is_ask: bool, smart: bool = False, pending_body=None) -> dict:
+                    is_ask: bool, smart: bool = False, pending_body=None, once_only: bool = False) -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
     ``pattern_keys`` are what :func:`_persist_choice` stores on session/always; a smart-DENY
@@ -1036,8 +1050,9 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     pending_body = pending_body() if pending_body else None
     # A command the scanners could not read to the end is approved one run at a time: a session or
     # always grant on its key would wave through every later command that trips the scan budget.
-    # A manual-only class (an osascript program that can discard unsaved work) is one run too.
-    one_shot = smart_denied or manual_only or _SCAN_INCOMPLETE_DESCRIPTION in pattern_keys
+    # A manual-only class (an osascript program that can discard unsaved work) is one run too, and
+    # so is a mandatory one-shot review of a script the lifecycle guard could not scan.
+    one_shot = smart_denied or manual_only or once_only or _SCAN_INCOMPLETE_DESCRIPTION in pattern_keys
     allow_permanent = not one_shot
 
     def deny(template: str, outcome: str, **fmt) -> dict:
@@ -1061,8 +1076,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                 choice, pattern_key, session_key, "/".join(sorted(CONSENT_ANSWERS)))
             return _denied(_UNRECOGNIZED_ANSWER, pattern_key=pattern_key,
                            description=description, outcome="unrecognized_answer", noun=spec.noun)
-        # A smart-DENY owner override or a manual-only class is always one operation, even if an older
-        # client returns "session" or "always".
+        # A smart-DENY owner override, a manual-only class or a mandatory one-shot review is always one
+        # operation, even if an older client returns "session" or "always".
         if not one_shot:
             _persist_choice(session_key, choice, pattern_keys)
         if spec.user_approved:
@@ -1133,12 +1148,11 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         if not _should_fall_through_to_cli_approval(
             is_cli=is_cli, approval_callback=approval_callback, notify_cb=notify_cb,
         ):
-            if not spec.pending_keys:
-                display_command, display_description = command, description
-            return _pending_result(
-                spec, session_key, command=display_command, description=display_description, pattern_key=pattern_key,
-                pattern_keys=pattern_keys, body=pending_body, smart_denied=smart_denied, gateway=is_gateway,
-                one_shot=one_shot,
+            return _unbridged_decision(
+                spec, session_key, command=command, description=description,
+                display=(display_command, display_description), pattern_key=pattern_key,
+                pattern_keys=pattern_keys, body=pending_body, smart_denied=smart_denied,
+                gateway=is_gateway, once_only=once_only, one_shot=one_shot,
             )
 
     # CLI interactive: single combined prompt, wrapped in the pre/post plugin hooks.
@@ -1401,7 +1415,7 @@ def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", ap
 
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False, required_review=None) -> dict:
     """Run all pre-exec security checks and return a single approval decision. Plugins that
     want to veto or escalate a command do it from ``pre_tool_call``.
     ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow."""
@@ -1411,6 +1425,27 @@ def check_all_command_guards(command: str, env_type: str,
     blocked = _floor_block(command, sudo_guard=True)
     if blocked is not None:
         return blocked
+
+    if required_review is not None:
+        callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
+        unattended = (_is_cron_approval_context() or _is_single_query_approval_context()
+                      or (_is_unattended_platform_approval_context()
+                          and (_get_session_platform() in approval_context._NOTIFIER_BLIND_APPROVAL_PLATFORMS
+                               or _gateway_notify_cb(get_current_session_key()) is None)))
+        if unattended or not (is_cli or is_gateway or is_ask):
+            return _blocked("BLOCKED: oversized-script review requires a human present; unattended execution is forbidden.",
+                            pattern_key="lifecycle_file_size", description=required_review.description)
+        # Include current findings even if a cache/allowlist/batch grant covers them. The mandatory
+        # exception always needs fresh consent, with the complete current approval provenance intact.
+        findings = _command_findings(command)
+        key = "lifecycle_file_size:" + hashlib.sha256(required_review.description.encode()).hexdigest()
+        keys = [key] + [k for k, _ in findings]
+        description = required_review.description + "; " + "; ".join(text for _, text in findings)
+        return _human_decision(
+            _COMMAND_GATE, command=command, description=description, pattern_key=key, pattern_keys=keys,
+            session_key=get_current_session_key(), approval_callback=callback, is_cli=is_cli,
+            is_gateway=is_gateway, is_ask=is_ask, once_only=True,
+        )
 
     from agent.terminal_approval_batch import consume_prepared_guard
     prepared = consume_prepared_guard(command, env_type, has_host_access)
