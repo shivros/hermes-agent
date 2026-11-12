@@ -971,7 +971,7 @@ def _command_requires_pipe_stdin(command: str) -> bool:
 
 from tools.terminal_tool_guards import (
     _foreground_background_guidance, _safe_command_preview, _validate_workdir,
-    gateway_lifecycle_block, locked_skill_block, self_repo_block, trailing_amp_background_command,
+    LifecycleScanReview, gateway_lifecycle_block, locked_skill_block, self_repo_block, trailing_amp_background_command,
 )
 from tools.terminal_tool_background import _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
 from tools.terminal_tool_result import finalize_foreground_result
@@ -1135,13 +1135,20 @@ class _ApprovalVerdict:
     approved_run: bool = False
 
 
-def _run_approval_guards(command: str, env_type: str, config: dict[str, Any], *, force: bool) -> _ApprovalVerdict:
-    """Run the command guards; ``force`` skips them entirely.
+def _run_approval_guards(command: str, env_type: str, config: dict[str, Any], *, force: bool,
+                         required_review=None) -> _ApprovalVerdict:
+    """Run the command guards; ``force`` skips ordinary approvals, never mandatory review.
     Raises :class:`_Rejected` when the command may not run (denied, or pending
     gateway approval)."""
-    if force:
+    if required_review is not None:
+        approval = _check_all_guards_impl(
+            command, env_type, has_host_access=_docker_has_host_access(config),
+            approval_callback=_get_approval_callback(), required_review=required_review,
+        )
+    elif force:
         return _ApprovalVerdict(approved_run=True)
-    approval = _check_all_guards(command, env_type, has_host_access=_docker_has_host_access(config))
+    else:
+        approval = _check_all_guards(command, env_type, has_host_access=_docker_has_host_access(config))
     if not approval["approved"]:
         if approval.get("status") == "pending_approval":  # gateway ask mode
             raise _Rejected(_error_json(
@@ -1367,12 +1374,12 @@ def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
     task_id: Optional[str], session_id: Optional[str], session_key: str,
     workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
-    metered: bool = True,
+    metered: bool = True, required_review=None,
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize. ``metered``
     is False for Hermes' own control-plane commands (``_host_local``)."""
     from hermes_cli.observability.shared_metrics_harness import record_terminal_outcome
-    max_retries = 3
+    max_retries = 0 if required_review is not None else 3
     env_type, eff, effective_timeout = plan.env_type, plan.effective_task_id, plan.effective_timeout
 
     # Clean interrupt slate for an approved command, ONCE before the retry
@@ -1391,6 +1398,9 @@ def _run_foreground(
                 mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
                 env=env,
             )
+            if required_review is not None and not required_review.valid_for(command, command_cwd):
+                raise _Rejected(_error_json("Blocked: reviewed script identity/content or cwd changed; obtain a fresh review.",
+                                            status="blocked"))
             # bounded_capture: model-facing output keeps a head/tail window
             # while streaming so a verbose command can't OOM the gateway;
             # internal env.execute() consumers stay unbounded.
@@ -1400,6 +1410,8 @@ def _run_foreground(
                                 task_id=task_id, session_key=session_key),
             )
             break
+        except _Rejected:
+            raise
         except Exception as e:
             # A backend exception (e.g. an SSH connect timeout) never reached an exit status, so it
             # is not a terminal outcome; Hermes' own deadline arrives as ``hermes_timed_out``.
@@ -1440,7 +1452,7 @@ _PRE_EXEC_GUARD_MIN_TIMEOUT_S = 30
 def _pre_exec_block(
     command: str, *, env: Any, env_type: str, cwd: str,
     workdir: Optional[str], session_key: str,
-) -> None:
+) -> Optional[LifecycleScanReview]:
     """Raise :class:`_Rejected` with the blocked-result JSON when the command must not run.
 
     Order matters: gateway lifecycle first (protects the running gateway),
@@ -1449,7 +1461,8 @@ def _pre_exec_block(
     blocked = gateway_lifecycle_block(
         command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
     )
-    if blocked:
+    review = blocked if isinstance(blocked, LifecycleScanReview) else None
+    if isinstance(blocked, str):
         raise _Rejected(blocked)
     if workdir:
         workdir_error = _validate_workdir(workdir)
@@ -1462,6 +1475,7 @@ def _pre_exec_block(
                    or locked_skill_block(command=command, cwd=cwd, workdir=workdir, session_key=session_key))
         if blocked:
             raise _Rejected(blocked)
+    return review
 
 
 _PTY_DISABLED_REASON = (
@@ -1585,8 +1599,16 @@ def terminal_tool(
                     status="error",
                 ))
             # Pre-exec security checks (floors + dangerous command detection);
-            # force=True means the user already confirmed.
-            verdict = _run_approval_guards(command, env_type, plan.config, force=force)
+            # Ordinary force replays carry no oversized-file consent; those always ask afresh.
+            review = bounded_guard.value
+            verdict = _run_approval_guards(command, env_type, plan.config, force=force,
+                                           **({"required_review": review} if review is not None else {}))
+            if review is not None:
+                command_cwd = _resolve_command_cwd(
+                    workdir=workdir, default_cwd=cwd, session_key=session_key, env_type=env_type, env=env)
+                if not review.valid_for(command, command_cwd):
+                    raise _Rejected(_error_json(
+                        "Blocked: reviewed script identity/content or cwd changed; obtain a fresh review.", status="blocked"))
 
             pty_disabled = pty and _command_requires_pipe_stdin(command)
             if plan.promoted_from_foreground_timeout is not None:
@@ -1613,7 +1635,7 @@ def terminal_tool(
                 command, env, plan,
                 task_id=task_id, session_id=session_id, session_key=session_key,
                 workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
-                metered=not _host_local,
+                metered=not _host_local, **({"required_review": review} if review is not None else {}),
             ))
     except _Rejected as r:
         return r.result_json

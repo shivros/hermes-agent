@@ -472,6 +472,34 @@ _MAX_LIFECYCLE_SCAN_PATHS = 1024
 _MAX_LIFECYCLE_SCAN_REMOTE_READS = 64
 
 
+class LifecycleRefusal(str):
+    """A diagnostic with a policy code, while preserving the public string/tuple API."""
+
+    reason: str
+    path: Path
+
+    def __new__(cls, message: str, reason: str, path: Path):
+        value = super().__new__(cls, message)
+        value.reason = reason
+        value.path = path
+        return value
+
+
+class LifecycleReviewScan:
+    """Opt-in local supervised review discovery; all other callers retain the hard block."""
+
+    def __init__(self):
+        self.oversized: list[LifecycleRefusal] = []
+        self.paths: set[Path] = set()
+        self.dynamic_cwd = False
+
+    def note_text(self, text: str) -> None:
+        # This narrow exception does not model shell/interpreter directory changes. A literal
+        # change in known code makes file binding ambiguous; keep it blocked, even in prose.
+        self.dynamic_cwd = self.dynamic_cwd or bool(re.search(
+            r"\b(?:cd|pushd|popd|chdir|fchdir)\b|--chdir|\benv\s+-C\b", text))
+
+
 class _LifecycleScanBudget:
     """Shared work budget for one complete referenced-script walk. ``refusal`` records why the walk
     failed closed for a reason other than a lifecycle command (budget, size, device, live SQLite,
@@ -483,6 +511,7 @@ class _LifecycleScanBudget:
         "paths_remaining",
         "refusal",
         "remote_reads_remaining",
+        "review",
     )
 
     def __init__(self) -> None:
@@ -492,6 +521,11 @@ class _LifecycleScanBudget:
         self.paths_remaining = _MAX_LIFECYCLE_SCAN_PATHS
         self.remote_reads_remaining = _MAX_LIFECYCLE_SCAN_REMOTE_READS
         self.refusal: Optional[str] = None
+        self.review: Optional[LifecycleReviewScan] = None
+
+    def note_path(self, path: Path) -> None:
+        if self.review is not None:
+            self.review.paths.add(path)
 
     def charge_text(self, text: str) -> bool:
         """Charge *text* before tokenization; False when it does not fit."""
@@ -511,6 +545,8 @@ class _LifecycleScanBudget:
             return False
         self.bytes_remaining -= encoded
         self.lines_remaining -= lines
+        if self.review is not None:
+            self.review.note_text(text)
         return True
 
     def charge_path(self) -> bool:
@@ -560,9 +596,10 @@ def _budget_exhausted(budget: _LifecycleScanBudget, what: str, depth: int) -> bo
     return True
 
 
-def _unreadable_reason(path: Path) -> str:
+def _unreadable_reason(path: Path, *, remaining: Optional[int] = None) -> str:
     """Name why an *executed* script failed closed without being scanned (live SQLite, device,
-    oversized). Message-only: the fail-closed verdict itself came from the bounded reader."""
+    oversized). Only the per-file cap carries a structured review code; the fail-closed
+    verdict itself came from the bounded reader."""
     from hermes_cli.sqlite_safe_read import has_live_connection
 
     if has_live_connection(path):
@@ -573,7 +610,13 @@ def _unreadable_reason(path: Path) -> str:
         return f"`{path}` could not be read"
     if not stat.S_ISREG(metadata.st_mode):
         return f"`{path}` is not a regular file"
-    return f"`{path}` is larger than the scan cap ({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget"
+    # Only a per-file cap refusal is eligible, never an exhausted aggregate walk.
+    if metadata.st_size > _MAX_REFERENCED_SCRIPT_BYTES and (remaining is None or remaining > 0):
+        return LifecycleRefusal(
+            f"`{path}` exceeds the per-file scan cap ({_MAX_REFERENCED_SCRIPT_BYTES} bytes)",
+            "file_size", path,
+        )
+    return f"`{path}` exceeds the remaining walk budget or could not be read"
 
 
 def _refuse_unreadable(budget: _LifecycleScanBudget, path: Path, reason: str) -> bool:
@@ -1090,6 +1133,23 @@ def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
 
 # --- recursive walk ---------------------------------------------------------------------------
 
+def _collect_oversized_review(budget: _LifecycleScanBudget, reason: str) -> bool:
+    """Only the structured per-file cap may be deferred; every other refusal stays final."""
+    if budget.review is None or not isinstance(reason, LifecycleRefusal) or reason.reason != "file_size":
+        return False
+    budget.review.oversized.append(reason)
+    return True
+
+
+def _unreadable_script_blocks(budget: _LifecycleScanBudget, path: Path, executed: bool) -> bool:
+    if not executed:
+        return False
+    reason = _unreadable_reason(path, remaining=budget.bytes_remaining)
+    if _collect_oversized_review(budget, reason):
+        return False
+    return _refuse_unreadable(budget, path, reason)
+
+
 def _contains_unsafe_gateway_action(
     command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True,
@@ -1141,6 +1201,7 @@ def _contains_unsafe_gateway_action(
                 )
             continue
         resolved = _resolve_lenient(script_path)
+        budget.note_path(script_path)
         if resolved in visited:
             continue
         if not budget.charge_path():
@@ -1152,8 +1213,9 @@ def _contains_unsafe_gateway_action(
         # remainder fails closed exactly like an oversized one.
         script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
         if unsafe:
-            if candidate_executed:
-                return _refuse_unreadable(budget, script_path, _unreadable_reason(script_path))
+            if _unreadable_script_blocks(budget, script_path, candidate_executed):
+                return True
+            # Keep scanning other references after a reviewable size refusal.
             continue
         if script_text is None and read_remote_script is not None:
             # Local path missing; the remote backend's output crosses the same trust boundary as a
@@ -1184,10 +1246,16 @@ def _contains_unsafe_gateway_action(
 def scan_gateway_lifecycle(
     command: str, *, cwd: Optional[str] = None,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    review: Optional[LifecycleReviewScan] = None,
 ) -> tuple[bool, Optional[str]]:
     """``(unsafe, refusal)``: *refusal* names a non-lifecycle reason the walk failed closed (budget,
     size, device, live SQLite, cloud) so callers can tell the model; ``None`` when the verdict is a
     real lifecycle command or the command is allowed.
+
+    ``review`` is local supervised discovery only: collect per-file size refusals while
+    continuing the bounded walk. The final verdict still fails closed. Callers may require
+    fresh one-shot human review only when the final refusal has the structured file-size code.
+    Discovery exceptions fail closed rather than using the historical direct-scan fallback.
 
     Total by construction: never raises. Direct scans are pure string ops; the referenced-script
     walk (filesystem, remote backends, shlex on decoded bytes) is best-effort defense-in-depth — an
@@ -1199,13 +1267,19 @@ def scan_gateway_lifecycle(
     verdict.
     """
     budget = _LifecycleScanBudget()
+    budget.review = review
     try:
         unsafe = _contains_unsafe_gateway_action(
             command, cwd=cwd, depth=0, visited=set(), budget=budget,
             read_remote_script=read_remote_script,
         )
+        if not unsafe and review is not None and review.oversized:
+            return True, review.oversized[0]
         return unsafe, budget.refusal if unsafe else None
     except Exception:
+        if review is not None:
+            logger.warning("lifecycle review discovery failed; failing closed", exc_info=True)
+            return True, "lifecycle review discovery failed"
         logger.warning(
             "lifecycle guard referenced-script walk failed; "
             "falling back to direct-scan verdict",

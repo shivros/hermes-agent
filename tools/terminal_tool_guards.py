@@ -10,6 +10,9 @@ keeps resolving.
 """
 
 import functools
+import hashlib
+import os
+from dataclasses import dataclass
 import json
 import logging
 import re
@@ -554,6 +557,89 @@ def _read_script_for_guard(env: Any, guard_cwd: str, script_path: str, max_bytes
     return None
 
 
+def _review_file_identity(path: Path, *, max_bytes: int = 64 * 1024 * 1024) -> tuple:
+    """Bounded streaming identity, not a scan-cap increase or an execution allowlist.
+
+    Refuse cloud/device/live SQLite before opening; an exception may only review local regular
+    files. Hashing is bounded at 64 MiB across a review to avoid a sparse-file denial of service.
+    """
+    from cron.lifecycle_guard import _on_cloud_path
+    from hermes_cli.sqlite_safe_read import has_live_connection
+
+    if _on_cloud_path(path) or has_live_connection(path):
+        raise ValueError("unreviewable path")
+    resolved = path.resolve(strict=True)
+    metadata = path.stat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("not a regular file")
+    # A FIFO replacement after stat must not hang the tool thread.
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(descriptor, "rb", buffering=0) as source:
+        before = os.fstat(source.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
+            raise ValueError("unreviewable size or file type")
+        digest = hashlib.sha256()
+        remaining = before.st_size + 1
+        while remaining:
+            chunk = source.read(min(65536, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            digest.update(chunk)
+        after = os.fstat(source.fileno())
+    def identity(s):
+        return (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+    if identity(before) != identity(after) or identity(after) != identity(path.stat()):
+        raise ValueError("script changed while hashing")
+    return str(resolved), identity(after), digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class LifecycleScanReview:
+    """Call-local review binding. Not a token: force/replays must obtain new human consent.
+
+    Revalidation narrows, but cannot eliminate, a shell's final path-open race. Oversized
+    contents remain UNKNOWN (including nested imports); the prompt must say that plainly.
+    """
+    command: str
+    cwd: str
+    cwd_identity: tuple
+    files: tuple
+    description: str
+
+    @classmethod
+    def capture(cls, command: str, cwd: str, scan):
+        if scan.dynamic_cwd:
+            raise ValueError("directory changes make referenced-script binding ambiguous")
+        directory = Path(cwd).resolve(strict=True)
+        metadata = directory.stat()
+        files = []
+        remaining = 64 * 1024 * 1024
+        for path in sorted(scan.paths):
+            identity = _review_file_identity(path, max_bytes=remaining)
+            remaining -= identity[1][2]
+            files.append((str(path), identity))
+        files = tuple(files)
+        description = (
+            "Mandatory one-shot review: lifecycle scan skipped oversized local script(s): "
+            + "; ".join(str(reason) for reason in scan.oversized)
+            + ". Their contents and nested execution are UNKNOWN and may stop/restart the gateway. "
+            + "Approve once only for this command, cwd and file identities. "
+            + f"cwd={directory}; SHA256=" + ", ".join(f"{p}: {i[2]}" for p, i in files)
+        )
+        return cls(command, str(directory), (metadata.st_dev, metadata.st_ino), files, description)
+
+    def valid_for(self, command: str, cwd: str) -> bool:
+        try:
+            directory = Path(cwd).resolve(strict=True)
+            metadata = directory.stat()
+            return (command == self.command and str(directory) == self.cwd
+                    and (metadata.st_dev, metadata.st_ino) == self.cwd_identity
+                    and all(_review_file_identity(Path(p)) == identity for p, identity in self.files))
+        except (OSError, ValueError):
+            return False
+
+
 def gateway_lifecycle_block(
     *,
     command: str,
@@ -562,7 +648,7 @@ def gateway_lifecycle_block(
     cwd: str,
     workdir: Optional[str],
     session_key: str,
-) -> Optional[str]:
+) -> Optional[str | LifecycleScanReview]:
     """Refuse gateway lifecycle commands issued from inside the supervised gateway.
 
     ``systemctl``/``launchctl``/``hermes gateway restart|stop|uninstall``
@@ -574,7 +660,8 @@ def gateway_lifecycle_block(
     serve, CLI, web server), which must still be able to restart the gateway;
     an unsupervised foreground ``hermes gateway run`` has no KeepAlive to turn
     a self-restart into a respawn loop, so it passes too.
-    Returns the JSON error string when blocked, else None.
+    Returns JSON when blocked, a bound mandatory review for local per-file size refusals,
+    else None. Remote backends never borrow this host's file identities for approval.
     """
     from tools.environments.sandbox_scope import hosted_scope
     from tools.process_registry import _is_supervised_gateway_process
@@ -586,6 +673,7 @@ def gateway_lifecycle_block(
         return None
     from cron.lifecycle_guard import (
         _MAX_REFERENCED_SCRIPT_BYTES,
+        LifecycleReviewScan,
         HOST_INTERPRETER_KILL_REJECTION,
         contains_host_interpreter_kill,
         contains_launchctl_submit_command,
@@ -613,11 +701,27 @@ def gateway_lifecycle_block(
         mounted_host=getattr(env, "host_cwd", None),
         env=env,
     )
+    review_scan = LifecycleReviewScan() if env_type == "local" else None
     unsafe, refusal = scan_gateway_lifecycle(
         command,
         cwd=guard_cwd,
         read_remote_script=lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES),
+        review=review_scan,
     )
+    if unsafe and review_scan is not None and getattr(refusal, "reason", None) == "file_size":
+        try:
+            binding = LifecycleScanReview.capture(command, guard_cwd, review_scan)
+            # Scan between two matching snapshots: never bind a changed wrapper that was not
+            # actually checked (or a symlink graph different from the discovery walk).
+            confirmed = LifecycleReviewScan()
+            _, confirmed_refusal = scan_gateway_lifecycle(command, cwd=guard_cwd, review=confirmed)
+            if (getattr(confirmed_refusal, "reason", None) == "file_size"
+                    and confirmed.paths == review_scan.paths and not confirmed.dynamic_cwd
+                    and binding.valid_for(command, guard_cwd)):
+                return binding
+            return _blocked_json("Blocked: referenced scripts changed during lifecycle review discovery.", "error")
+        except (OSError, ValueError):
+            return _blocked_json("Blocked: could not bind oversized-script review to local file identities.", "error")
     if unsafe and refusal:
         # Not a lifecycle command: a script the command EXECUTES could not be scanned (budget,
         # size, device, live SQLite, cloud placeholder). Say so, or the model rewords and retries
