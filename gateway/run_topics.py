@@ -11,6 +11,7 @@ import re
 import threading
 import time
 from contextlib import contextmanager, suppress
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -48,6 +49,8 @@ def _collapse_title(title: str) -> str:
 
 class GatewayTopicThreadsMixin:
     """Telegram forum-topic and Discord auto-thread binding/rename methods for GatewayRunner."""
+
+    _TELEGRAM_GENERAL_TOPIC_IDS: frozenset[str]
 
     # ── Telegram topic mode: predicates and keys ────────────────────────────────────────────
 
@@ -103,6 +106,17 @@ class GatewayTopicThreadsMixin:
             detached_route_of(source) is None
             and self._is_telegram_dm(source) and self._telegram_topic_mode_enabled(source)
             and bool(tid) and tid not in self._TELEGRAM_GENERAL_TOPIC_IDS
+        )
+
+    def _is_telegram_renamable_topic(self, source: SessionSource) -> bool:
+        """Rename-only eligibility: forum topics do not participate in DM topic routing."""
+        from gateway.session_detached import detached_route_of
+        tid = str(source.thread_id or "")
+        return (
+            detached_route_of(source) is None
+            and source.platform == Platform.TELEGRAM
+            and bool(tid) and tid not in self._TELEGRAM_GENERAL_TOPIC_IDS and tid != "0"
+            and (source.chat_type in ("forum", "group", "supergroup") or self._is_telegram_topic_lane(source))
         )
 
     def _telegram_topic_cooldown_key(self, source: SessionSource) -> Optional[str]:
@@ -651,7 +665,7 @@ class GatewayTopicThreadsMixin:
 
     def _schedule_telegram_topic_title_rename(self, source: SessionSource, session_id: str, title: str) -> None:
         """Schedule a topic rename from the auto-title background thread."""
-        if not title or not self._is_telegram_topic_lane(source) or self._telegram_topic_auto_rename_disabled(source):
+        if not title or not self._is_telegram_renamable_topic(source) or self._telegram_topic_auto_rename_disabled(source):
             return
         self._schedule_rename_from_title_thread(
             source,
@@ -664,11 +678,18 @@ class GatewayTopicThreadsMixin:
         multiplexing each bot owns its kill-switch, like ``dm_topic_auto_transfer``."""
         adapter = self._delivery_adapter_for(source)
         platform_cfg = getattr(adapter, "config", None) if adapter is not None else None
-        return is_truthy_value((getattr(platform_cfg, "extra", None) or {}).get("disable_topic_auto_rename"))
+        extra = getattr(platform_cfg, "extra", None) or {}
+        # Legacy exclusion lists belong to the receiving bot too, never the launch profile.
+        excluded = extra.get("topic_rename_exclude_ids") or []
+        return is_truthy_value(extra.get("disable_topic_auto_rename")) or str(source.thread_id or "") in {
+            str(tid) for tid in excluded
+        }
 
-    async def _rename_telegram_topic_for_session_title(self, source: SessionSource, session_id: str, title: str) -> None:
-        """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
-        if not await asyncio.to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
+    async def _rename_telegram_topic_for_session_title(
+        self, source: SessionSource, session_id: str, title: str, *, _retry: bool = True,
+    ) -> None:
+        """Best-effort rename of a Telegram topic when Hermes auto-titles a session."""
+        if not await asyncio.to_thread(self._is_telegram_renamable_topic, source) or not source.chat_id or not source.thread_id:
             return
         # Operator kill-switch, e.g. user-managed topics (ad-hoc Threaded Mode) that auto-rename
         # would keep overwriting.
@@ -715,7 +736,19 @@ class GatewayTopicThreadsMixin:
                 await edit_forum_topic(chat_id=int(source.chat_id), message_thread_id=int(source.thread_id), name=topic_name)
             except (TypeError, ValueError):
                 await edit_forum_topic(chat_id=source.chat_id, message_thread_id=source.thread_id, name=topic_name)
-        except Exception:
+        except Exception as exc:
+            delay = getattr(exc, "retry_after", None)
+            try:
+                if delay is not None:
+                    delay = delay.total_seconds() if isinstance(delay, timedelta) else float(delay)
+            except (TypeError, ValueError):
+                delay = None
+            # Best effort: skip long penalties rather than cap the wait and retry too early.
+            if _retry and delay is not None and 0 <= delay <= 60:
+                await asyncio.sleep(delay)
+                # Re-enter every guard: a session switch or bot opt-out during the wait wins.
+                await self._rename_telegram_topic_for_session_title(source, session_id, title, _retry=False)
+                return
             logger.debug("Failed to rename Telegram topic for auto-generated title", exc_info=True)
 
     # ── /topic command bodies ───────────────────────────────────────────────────────────────
