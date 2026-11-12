@@ -1008,7 +1008,7 @@ def _has_binary_magic(data: bytes) -> bool:
 
 
 def _read_referenced_script(
-    path: Path, *, max_bytes: Optional[int] = None
+    path: Path, *, max_bytes: Optional[int] = None, strict_io: bool = False
 ) -> tuple[Optional[str], bool]:
     """Read a referenced script without racing SQLite connection lifecycle.
 
@@ -1016,21 +1016,28 @@ def _read_referenced_script(
     sequence. A separate ``has_live_connection`` check would leave a race in
     which another thread opens SQLite after the check but before this function
     closes its descriptor, cancelling that connection's POSIX locks.
+
+    ``strict_io`` preserves scanner failures for review discovery: the scan boundary refuses
+    them instead of mistaking them for binary/non-script inputs or retrying through a backend.
     """
     from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
 
     try:
         with offline_file_access(path, what="read referenced script"):
-            return _read_referenced_script_unlocked(path, max_bytes=max_bytes)
+            return _read_referenced_script_unlocked(path, max_bytes=max_bytes, strict_io=strict_io)
     except LiveConnectionError:
         return None, True
-    except (OSError, ValueError):
+    except OSError:
+        if strict_io:
+            raise
+        return None, False
+    except ValueError:
         # Invalid path values, including embedded NULs, are not scripts.
         return None, False
 
 
 def _read_referenced_script_unlocked(
-    path: Path, *, max_bytes: Optional[int] = None
+    path: Path, *, max_bytes: Optional[int] = None, strict_io: bool = False
 ) -> tuple[Optional[str], bool]:
     """Return ``(text, unsafe)`` using bounded, regular-file-only reads.
 
@@ -1047,9 +1054,16 @@ def _read_referenced_script_unlocked(
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except (OSError, ValueError):
-        # OSError: unreadable/missing/over-long. ValueError: embedded NUL in *path*. Either is
-        # "nothing to scan" — never crash the guard.
+    except (FileNotFoundError, NotADirectoryError):
+        # An absent local candidate can still be read by a remote backend. Review identity
+        # capture requires every discovered path to exist locally, so this cannot grant review.
+        return None, False
+    except OSError:
+        if strict_io:
+            raise
+        return None, False
+    except ValueError:
+        # Embedded NUL in a tokenized path is not a script.
         return None, False
     try:
         # ValueError: an embedded NUL byte in *path* itself — a binary's decoded bytes tokenized into a
@@ -1081,6 +1095,8 @@ def _read_referenced_script_unlocked(
                 break
             data += chunk
     except OSError:
+        if strict_io:
+            raise
         return None, False
     finally:
         os.close(descriptor)
@@ -1211,7 +1227,10 @@ def _contains_unsafe_gateway_action(
         visited.add(resolved)
         # Never read more than the walk can still afford to tokenize; a file larger than the
         # remainder fails closed exactly like an oversized one.
-        script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
+        # Review must preserve scanner I/O errors, including on oversized files: a later hash
+        # or backend fallback does not prove this read succeeded. The scan boundary fails closed.
+        script_text, unsafe = _read_referenced_script(
+            script_path, max_bytes=budget.bytes_remaining, strict_io=budget.review is not None)
         if unsafe:
             if _unreadable_script_blocks(budget, script_path, candidate_executed):
                 return True
@@ -1237,8 +1256,9 @@ def _contains_unsafe_gateway_action(
                 continue
         if not script_text:
             continue
-        # Relative references inside a script resolve against that script's directory, not the cwd.
-        if recurse(script_text, _resolve_script_directory(str(resolved)) or cwd, candidate_executed):
+        # Executed and sourced shells inherit cwd; opening a wrapper does not chdir to its parent.
+        # Review separately rejects known directory changes rather than guessing their effect.
+        if recurse(script_text, cwd, candidate_executed):
             return True
     return False
 
